@@ -12,11 +12,15 @@
 
 enum {
   COMMAND,
-  X,
-  Y,
-  PULSER_1,
-  PULSER_2,
-  PULSER_3,
+  X_DIRECT_WRITE,
+  Y_DIRECT_WRITE,
+  PULSER_1_DUTY,
+  PULSER_2_DUTY,
+  PULSER_3_DUTY,
+  SAMPLES_RATE,
+  AMPLITUDE,
+  PHASE,
+  OFFSET,
   BERTAN_1_OC,
   BERTAN_2_OC,
   MATSUSADA_1_OC,
@@ -25,28 +29,37 @@ enum {
 
 unsigned int InputDataReg [SIZE];
 int cmdreg = 0;
-int xreg = 0;
+uint16_t xreg = 0;
+uint16_t yreg = 0;
+uint8_t pwm1_reg = 0;
+uint8_t pwm2_reg = 0;
+uint8_t pwm3_reg = 0;
 
 uint8_t tx_buf[2];
 uint8_t rx_buf[2];
 
 ModbusSerial ModbusObj (Serial2, DEVICE_ID, -1);
 
-const uint32_t sampling_rate = 44100;  // 120 kHz sampling rate
-const uint16_t frequency = 60;         // 60 Hz sine wave
-//const uint16_t SAMPLES = 32768;
-
 bool core1_separate_stack = true;
 int localcmd = 0;
-uint16_t SAMPLES = 8192;
+
+uint16_t samples = 8192;
+uint16_t amp = 32767;
+int16_t phase = 0;
+int16_t offset = 0;
 
 void ModBuspacketHandler(){
-  //for(int i = 0; i < SIZE; i++){
-  //  InputDataReg[i] = ModbusObj.Hreg(0x00 + (i<<2));
-  //}
-  localcmd = ModbusObj.Hreg(0x00 + 0);
-  xreg = ModbusObj.Hreg(0x00 + 1);
-  SAMPLES = ModbusObj.Hreg(0x00 + 3);
+  xreg = ModbusObj.Hreg(X_DIRECT_WRITE);
+  yreg = ModbusObj.Hreg(Y_DIRECT_WRITE);
+  pwm1_reg = ModbusObj.Hreg(PULSER_1_DUTY);
+  pwm2_reg = ModbusObj.Hreg(PULSER_2_DUTY);
+  pwm3_reg = ModbusObj.Hreg(PULSER_3_DUTY);
+  samples = ModbusObj.Hreg(SAMPLES_RATE);
+  amp = ModbusObj.Hreg(AMPLITUDE);
+  phase = ModbusObj.Hreg(PHASE);
+  offset = ModbusObj.Hreg(OFFSET);
+
+  localcmd = ModbusObj.Hreg(COMMAND); //This should be update in the end
 }
 
 void setup1(){
@@ -54,7 +67,7 @@ void setup1(){
   //SPI.setSCK(2);
   //SPI.setMOSI(3);
   //SPI.begin(true);
-  spi_init(spi_default, 30000 * 1000);
+  spi_init(spi_default, 40000 * 1000);
   spi_set_format(spi_default, 16, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
     gpio_set_function(-1, GPIO_FUNC_SPI);
     gpio_set_function(2, GPIO_FUNC_SPI);
@@ -75,21 +88,22 @@ void setup() {
   ModbusObj.setAdditionalServerData ("TEST");
 
   pinMode(14, OUTPUT);
-  //pinMode(5, OUTPUT);
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(14, LOW);
-  //digitalWrite(5, HIGH);
-  //for(int i = 0; i < SIZE; i++){
-    ModbusObj.addHreg(0x00 + 0, cmdreg);
+    ModbusObj.addHreg(COMMAND, cmdreg);
     ModbusObj.addCoil(12);
     ModbusObj.addCoil(13);
     ModbusObj.addCoil(14);
     ModbusObj.addCoil(15);
-    ModbusObj.addHreg(0x00 + 1, xreg);
-    ModbusObj.addHreg(0x00 + 2, 0);
-    ModbusObj.addHreg(0x00 + 3, SAMPLES);
-  //}
-  
+    ModbusObj.addHreg(X_DIRECT_WRITE, xreg);
+    ModbusObj.addHreg(Y_DIRECT_WRITE, yreg);
+    ModbusObj.addHreg(PULSER_1_DUTY, pwm1_reg);
+    ModbusObj.addHreg(PULSER_2_DUTY, pwm2_reg);
+    ModbusObj.addHreg(PULSER_3_DUTY, pwm3_reg);
+    ModbusObj.addHreg(SAMPLES_RATE, samples);
+    ModbusObj.addHreg(AMPLITUDE, amp);
+    ModbusObj.addHreg(PHASE, phase);
+    ModbusObj.addHreg(OFFSET, offset);
 }
 
 int cnt = 0;
@@ -98,40 +112,46 @@ uint16_t out_buf[16];
 uint16_t sine_wave[65535];
 uint32_t command = 0;
 uint16_t val;
-volatile uint16_t phase = 0;
 void loop1(){
- // if(rp2040.fifo.available()) command = rp2040.fifo.pop();
-    if(localcmd == 1){
-      for(int i = 0; i< SAMPLES; i = i + 2){
-        out_buf[0] = i;
+    if(localcmd == 0){
+      out_buf[0] = xreg;
+      spi_write16_blocking(spi_default, out_buf, 1);
+    }else if(localcmd == 1){
+      out_buf[0] = yreg;
+      spi_write16_blocking(spi_default, out_buf, 1);
+    }else if(localcmd == 2){
+      for(int i = 0; i< samples; i = i + (65536 / samples)){ //Slope
+        out_buf[0] = (65536 / samples) * (i + phase) + offset;
         spi_write16_blocking(spi_default, out_buf, 1);
       }
-    }else if(localcmd == 2){
-      for(uint16_t i = 0; i < SAMPLES; i++){
-        out_buf[0] = 32767 * sin(2*M_PI*i/SAMPLES) + 32767;//lut2[i];
+    }else if(localcmd == 3){
+      for(uint16_t i = 0; i < samples; i++){ //Sine wave
+        out_buf[0] = amp * sin(2*M_PI*(i + phase)/samples) + amp + offset;//lut2[i];
         spi_write16_blocking(spi_default, out_buf, 1);
         
       }
-    }else if(localcmd == 3){
-      for(uint16_t i = 0; i< SAMPLES; i = i + 1){
-        out_buf[0] = 32767 * (4*abs(i/SAMPLES-floor(i/SAMPLES+1/2))-1) + 32767 ;
+    }else if(localcmd == 4){ //Triangle Wave
+      for(int i = 0; i< samples; i = i + (65536 / samples)){ //Slope
+        out_buf[0] = (65536 / samples) * (i + phase) + offset;
         spi_write16_blocking(spi_default, out_buf, 1);
       }
-    }else if(localcmd == 4){
-      for(uint16_t i = 0; i< 16384; i = i + 1){
-        out_buf[0] = hammingwave[i];
+
+      for(int i = samples - 1; i > 0; i = i - (65536 / samples)){ //Slope
+        out_buf[0] = (65536 / samples) * (i + phase) + offset;
+        spi_write16_blocking(spi_default, out_buf, 1);
+      }
+    }else if(localcmd == 5){ //Hamming Wave
+      for(uint16_t i = 0; i< samples; i++){
+        out_buf[0] = amp * (0.5-0.4*cos((2*M_PI*(i + phase)/(samples-1)))) + amp + offset;
         spi_write16_blocking(spi_default, out_buf, 1);
       }
     }
 }
 
-double theta;
-double amplitude;
 void loop() {
   // put your main code here, to run repeatedly:
   ModbusObj.task();
   digitalWrite(LED_BUILTIN, ModbusObj.Coil(12));
-  analogWrite(14, ModbusObj.Hreg(0x00 + 2));
+  analogWrite(14, ModbusObj.Hreg(PULSER_1_DUTY));
   ModBuspacketHandler();
-  //localcmd = ModbusObj.Coil(13);
 }
