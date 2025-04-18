@@ -67,7 +67,7 @@ void setup1(){
   //SPI.setSCK(2);
   //SPI.setMOSI(3);
   //SPI.begin(true);
-  spi_init(spi_default, 40000 * 1000);
+  spi_init(spi_default, 36000 * 1000);
   spi_set_format(spi_default, 16, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
     gpio_set_function(-1, GPIO_FUNC_SPI);
     gpio_set_function(2, GPIO_FUNC_SPI);
