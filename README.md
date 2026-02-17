@@ -8,7 +8,7 @@ The Beam Controller (BCON) acts as an intermediary device executing user command
 
 - **KB_Interlock** - when low (0), pulser output should be 0. When high (1), pulser output can be remotely enabled.
 - **Dashboard serial communication over RS485** - the actions of BCON are primarily driven by user-controlled software on a Python dashboard. The dashboard sets pulser output behavior as described in **Pulser Output Behavior**.
-- **Pulsar status signals** - one status signal set for each of the three pulsers:
+- **Pulser status signals** - one status signal set for each of the three pulsers:
   - Enable status
   - Power status
   - Over-current status
