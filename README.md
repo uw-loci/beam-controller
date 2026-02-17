@@ -9,15 +9,27 @@ The Beam Controller (BCON) acts as an intermediary device executing user command
 - **KB_Interlock** - when low (0), pulser output should be 0. When high (1), pulser output can be remotely enabled.
 - **Dashboard serial communication over RS485** - the actions of BCON are primarily driven by user-controlled software on a Python dashboard. The dashboard sets pulser output behavior as described in **Pulser Output Behavior**.
 - **Pulsar status signals** - one status signal set for each of the three pulsers:
-  - Enable status - displayed
+  - Enable status
   - Power status
-  - Over-current status - displayed
+  - Over-current status
   - Gated status
 
 ## Outputs
 
 - **Pulser output** - one output for each of the three pulsers as described in **Pulser Output Behavior**.
 - **Power LED** - an external chassis power LED should be fed when the Arduino is powered.
+- **Telemetry data output (RS485)** - BCON periodically transmits system-level telemetry to the dashboard. The `SYS` line reports controller state and timing fields:
+  - `state` (`READY`, `SAFE_INTERLOCK`, `SAFE_WATCHDOG`, `FAULT_LATCHED`)
+  - `reason` (`NONE`, `INTERLOCK_LOW`, `WATCHDOG_EXPIRED`, `FAULT_LATCHED`)
+  - `fault_latched` (`0` or `1`)
+  - `telemetry_ms` (configured telemetry interval; `0` disables periodic telemetry)
+- **Status output (RS485 per channel)** - BCON transmits one `CHn` status line per pulser channel containing:
+  - `mode` (`OFF`, `DC`, `PULSE`)
+  - `pulse_ms` (configured pulse duration)
+  - `en_st` (enable status input)
+  - `pwr_st` (power status input)
+  - `oc_st` (over-current status input)
+  - `gated_st` (gated status input)
 
 ## Pulser Output Behavior
 
