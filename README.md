@@ -115,3 +115,21 @@ flowchart TD
   T1 --> D
   T2 --> D
 ```
+
+## RS-485 Command Structure
+
+| Command | Structure (tokens) | Args / Ranges | Example | Typical response | Notes |
+| ------------- | ----------------------------------- | --------------------------------------- | ---------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PING | `PING` | none | `PING\n` | `PONG` | Also refreshes comm watchdog because any complete line updates `lastCommandMillis`. |
+| HELP | `HELP` | none | `HELP\n` | Multiple `CMD ...` lines | Prints the supported command list. |
+| STATUS | `STATUS` | none | `STATUS\n` | Multi-line report | System + per-channel report. |
+| GET STATUS | `GET STATUS` | none | `GET STATUS\n` | Multi-line report | Same as `STATUS`. |
+| STOP ALL | `STOP ALL` | none | `STOP ALL\n` | `OK ALL_OFF` | Forces all channels to OFF mode. |
+| SET WATCHDOG | `SET WATCHDOG <ms>` | `ms` must be **50…60000** | `SET WATCHDOG 1000\n` | `OK WATCHDOG_UPDATED` or `ERR ...` | Errors: `ERR SET WATCHDOG <ms>`, `ERR INVALID_WATCHDOG`, `ERR WATCHDOG_RANGE`. |
+| SET TELEMETRY | `SET TELEMETRY <ms\|0>` | `0` disables; otherwise any `uint32` | `SET TELEMETRY 1000\n` | `OK TELEMETRY_UPDATED` or `ERR ...` | Errors: `ERR SET TELEMETRY <ms\|0>`, `ERR INVALID_TELEMETRY`. |
+| SET CH OFF | `SET CH <1..3> OFF` | Channel `1..3` | `SET CH 2 OFF\n` | `OK CH_OFF` or `ERR ...` | Blocked unless system state is READY (`ERR NOT_READY`). |
+| SET CH DC | `SET CH <1..3> DC` | Channel `1..3` | `SET CH 1 DC\n` | `OK CH_DC` or `ERR ...` | Blocked unless READY (`ERR NOT_READY`). |
+| SET CH PULSE | `SET CH <1..3> PULSE <duration_ms>` | Channel `1..3`; duration **1…60000 ms** | `SET CH 3 PULSE 250\n` | `OK CH_PULSE` or `ERR ...` | Errors: `ERR SET CH <n> PULSE <duration_ms>`, `ERR INVALID_DURATION`, `ERR DURATION_RANGE`, `ERR NOT_READY`. Pulse ends automatically and channel returns to OFF. |
+| CLEAR FAULT | `CLEAR FAULT` | none | `CLEAR FAULT\n` | `OK FAULT_CLEARED` or `ERR ...` | Also accepts `ARM` as an alias (same behavior). |
+| ARM | `ARM` | none | `ARM\n` | `OK FAULT_CLEARED` or `ERR ...` | Fails with `ERR FAULT_STILL_ACTIVE` if any OC status is still asserted, or `ERR INTERLOCK_NOT_READY` if interlock isn’t satisfied. |
+
