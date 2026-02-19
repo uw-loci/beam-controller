@@ -1,8 +1,18 @@
 #include <Arduino.h>
 #include <string.h>
 
+#ifndef BCON_MODBUS_USE_USB_SERIAL
+#define BCON_MODBUS_USE_USB_SERIAL 1
+#endif
+
+#if BCON_MODBUS_USE_USB_SERIAL
+#define BCON_MODBUS_PORT Serial
+#else
+#define BCON_MODBUS_PORT Serial1
+#endif
+
 #ifndef BCON_ENABLE_I2C_LCD
-#define BCON_ENABLE_I2C_LCD 0
+#define BCON_ENABLE_I2C_LCD 1
 #endif
 
 #if BCON_ENABLE_I2C_LCD
@@ -14,10 +24,11 @@ namespace Config {
 
 constexpr uint8_t CHANNEL_COUNT = 3;
 
-HardwareSerial &RS485_SERIAL = Serial1;
+HardwareSerial &RS485_SERIAL = BCON_MODBUS_PORT;
 constexpr uint32_t RS485_BAUD = 115200;
 constexpr uint8_t RS485_DE_RE_PIN = 2;
 constexpr uint8_t MODBUS_SLAVE_ID = 1;
+constexpr bool USE_USB_SERIAL = (BCON_MODBUS_USE_USB_SERIAL != 0);
 
 constexpr uint32_t DEFAULT_WATCHDOG_TIMEOUT_MS = 1000;
 constexpr uint32_t DEFAULT_TELEMETRY_MS = 1000;
@@ -101,6 +112,11 @@ struct ChannelControl {
 
 ChannelControl channels[Config::CHANNEL_COUNT];
 
+volatile uint32_t chCountdownMs[Config::CHANNEL_COUNT] = {0};
+volatile bool chEventFlag[Config::CHANNEL_COUNT] = {false};
+volatile uint32_t lcdCountdownMs = 0;
+volatile bool lcdEventFlag = false;
+
 uint32_t lastCommandMillis = 0;
 uint32_t watchdogTimeoutMs = Config::DEFAULT_WATCHDOG_TIMEOUT_MS;
 uint32_t telemetryPeriodMs = Config::DEFAULT_TELEMETRY_MS;
@@ -110,8 +126,6 @@ ModbusError lastModbusError = ModbusError::None;
 uint8_t modbusRxBuffer[Config::MODBUS_RX_BUFFER_SIZE] = {0};
 size_t modbusRxIndex = 0;
 uint32_t lastModbusByteMillis = 0;
-
-uint32_t lastLcdRefreshMillis = 0;
 
 }  // namespace Runtime
 
@@ -235,6 +249,10 @@ static void pulseEnableToggle(uint8_t channelIndex) {
 }
 
 static void rs485SetTransmit(bool enabled) {
+  if (Config::USE_USB_SERIAL) {
+    (void)enabled;
+    return;
+  }
   digitalWrite(Config::RS485_DE_RE_PIN, enabled ? HIGH : LOW);
 }
 
@@ -289,11 +307,116 @@ static void forceAllOutputsLow() {
   }
 }
 
+static void armChannelTimer(uint8_t channel, uint32_t delayMs) {
+  noInterrupts();
+  Runtime::chCountdownMs[channel] = delayMs;
+  Runtime::chEventFlag[channel] = false;
+  interrupts();
+}
+
+static void clearChannelTimer(uint8_t channel) {
+  noInterrupts();
+  Runtime::chCountdownMs[channel] = 0;
+  Runtime::chEventFlag[channel] = false;
+  interrupts();
+}
+
+static void channelTimerTick(uint8_t channel) {
+  if (Runtime::chCountdownMs[channel] > 0) {
+    Runtime::chCountdownMs[channel]--;
+    if (Runtime::chCountdownMs[channel] == 0) {
+      Runtime::chEventFlag[channel] = true;
+    }
+  }
+}
+
+static void lcdTimerTick() {
+  if (Runtime::lcdCountdownMs > 0) {
+    Runtime::lcdCountdownMs--;
+    if (Runtime::lcdCountdownMs == 0) {
+      Runtime::lcdEventFlag = true;
+    }
+  }
+}
+
+ISR(TIMER1_COMPA_vect) { channelTimerTick(0); }
+ISR(TIMER3_COMPA_vect) { channelTimerTick(1); }
+ISR(TIMER4_COMPA_vect) { channelTimerTick(2); }
+ISR(TIMER5_COMPA_vect) { lcdTimerTick(); }
+
+static void setupChannelTimers() {
+  noInterrupts();
+
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1 = 0;
+  OCR1A = 249;
+  TCCR1B |= (1 << WGM12);
+  TCCR1B |= (1 << CS11) | (1 << CS10);
+  TIMSK1 |= (1 << OCIE1A);
+
+  TCCR3A = 0;
+  TCCR3B = 0;
+  TCNT3 = 0;
+  OCR3A = 249;
+  TCCR3B |= (1 << WGM32);
+  TCCR3B |= (1 << CS31) | (1 << CS30);
+  TIMSK3 |= (1 << OCIE3A);
+
+  TCCR4A = 0;
+  TCCR4B = 0;
+  TCNT4 = 0;
+  OCR4A = 249;
+  TCCR4B |= (1 << WGM42);
+  TCCR4B |= (1 << CS41) | (1 << CS40);
+  TIMSK4 |= (1 << OCIE4A);
+
+  interrupts();
+}
+
+static void armLcdTimer(uint32_t delayMs) {
+  noInterrupts();
+  Runtime::lcdCountdownMs = delayMs;
+  Runtime::lcdEventFlag = false;
+  interrupts();
+}
+
+static bool consumeLcdTimerEvent() {
+  bool event = false;
+  noInterrupts();
+  if (Runtime::lcdEventFlag) {
+    Runtime::lcdEventFlag = false;
+    event = true;
+  }
+  interrupts();
+  return event;
+}
+
+static void setupLcdTimer() {
+  noInterrupts();
+
+  TCCR5A = 0;
+  TCCR5B = 0;
+  TCNT5 = 0;
+  OCR5A = 249;
+  TCCR5B |= (1 << WGM52);
+  TCCR5B |= (1 << CS51) | (1 << CS50);
+  TIMSK5 |= (1 << OCIE5A);
+
+  Runtime::lcdCountdownMs = 0;
+  Runtime::lcdEventFlag = false;
+
+  interrupts();
+}
+
 static void setChannelOff(uint8_t indexZeroBased) {
   Runtime::ChannelControl &cfg = Runtime::channels[indexZeroBased];
   cfg.mode = Runtime::OutputMode::Off;
   cfg.pulsesRemaining = 0;
   cfg.pulseTrainInLowGap = false;
+  cfg.lastLevel = false;
+  digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[indexZeroBased], LOW);
+  clearChannelTimer(indexZeroBased);
 }
 
 static void setChannelDC(uint8_t indexZeroBased) {
@@ -301,6 +424,9 @@ static void setChannelDC(uint8_t indexZeroBased) {
   cfg.mode = Runtime::OutputMode::DC;
   cfg.pulsesRemaining = 0;
   cfg.pulseTrainInLowGap = false;
+  cfg.lastLevel = true;
+  digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[indexZeroBased], HIGH);
+  clearChannelTimer(indexZeroBased);
 }
 
 static void setChannelPulse(uint8_t indexZeroBased, uint32_t durationMs) {
@@ -311,6 +437,9 @@ static void setChannelPulse(uint8_t indexZeroBased, uint32_t durationMs) {
   cfg.pulsesRemaining = 1;
   cfg.pulseStartMs = millis();
   cfg.pulseTrainInLowGap = false;
+  cfg.lastLevel = true;
+  digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[indexZeroBased], HIGH);
+  armChannelTimer(indexZeroBased, cfg.pulseDurationMs);
 }
 
 static void setChannelPulseTrain(uint8_t indexZeroBased, uint32_t durationMs, uint32_t count) {
@@ -321,6 +450,9 @@ static void setChannelPulseTrain(uint8_t indexZeroBased, uint32_t durationMs, ui
   cfg.pulsesRemaining = count;
   cfg.pulseStartMs = millis();
   cfg.pulseTrainInLowGap = false;
+  cfg.lastLevel = true;
+  digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[indexZeroBased], HIGH);
+  armChannelTimer(indexZeroBased, cfg.pulseDurationMs);
 }
 
 static void applyOutputs() {
@@ -333,74 +465,97 @@ static void applyOutputs() {
 
   for (uint8_t channel = 0; channel < Config::CHANNEL_COUNT; ++channel) {
     Runtime::ChannelControl &cfg = Runtime::channels[channel];
-    bool level = LOW;
-
     switch (cfg.mode) {
       case Runtime::OutputMode::Off:
-        level = LOW;
+        if (cfg.lastLevel) {
+          cfg.lastLevel = false;
+          digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[channel], LOW);
+        }
+        clearChannelTimer(channel);
         break;
 
       case Runtime::OutputMode::DC:
-        level = HIGH;
+        if (!cfg.lastLevel) {
+          cfg.lastLevel = true;
+          digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[channel], HIGH);
+        }
+        clearChannelTimer(channel);
         break;
 
       case Runtime::OutputMode::Pulse: {
-        const uint32_t nowMs = millis();
-        const uint32_t elapsedMs = nowMs - cfg.pulseStartMs;
-        if (elapsedMs < cfg.pulseDurationMs) {
-          level = HIGH;
-        } else {
-          level = LOW;
+        bool event = false;
+        noInterrupts();
+        if (Runtime::chEventFlag[channel]) {
+          Runtime::chEventFlag[channel] = false;
+          event = true;
+        }
+        interrupts();
+
+        if (!event) {
+          break;
+        }
+
+        if (cfg.lastLevel) {
+          cfg.lastLevel = false;
+          digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[channel], LOW);
           cfg.mode = Runtime::OutputMode::Off;
           cfg.pulsesRemaining = 0;
+          clearChannelTimer(channel);
         }
         break;
       }
 
       case Runtime::OutputMode::PulseTrain: {
-        if (cfg.pulsesRemaining == 0) {
-          level = LOW;
-          cfg.mode = Runtime::OutputMode::Off;
-          cfg.pulseTrainInLowGap = false;
+        bool event = false;
+        noInterrupts();
+        if (Runtime::chEventFlag[channel]) {
+          Runtime::chEventFlag[channel] = false;
+          event = true;
+        }
+        interrupts();
+
+        if (!event) {
           break;
         }
 
-        const uint32_t nowMs = millis();
-        const uint32_t elapsedMs = nowMs - cfg.pulseStartMs;
-
-        if (!cfg.pulseTrainInLowGap) {
-          if (elapsedMs < cfg.pulseDurationMs) {
-            level = HIGH;
-          } else {
+        if (cfg.lastLevel) {
+          cfg.lastLevel = false;
+          digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[channel], LOW);
+          if (cfg.pulsesRemaining > 0) {
             cfg.pulsesRemaining--;
-            if (cfg.pulsesRemaining == 0) {
-              level = LOW;
-              cfg.mode = Runtime::OutputMode::Off;
-              cfg.pulseTrainInLowGap = false;
-            } else {
-              level = LOW;
-              cfg.pulseTrainInLowGap = true;
-              cfg.pulseStartMs = nowMs;
-            }
+          }
+
+          if (cfg.pulsesRemaining == 0) {
+            clearChannelTimer(channel);
+          cfg.mode = Runtime::OutputMode::Off;
+          cfg.pulseTrainInLowGap = false;
+          } else {
+            cfg.pulseTrainInLowGap = true;
+            cfg.pulseStartMs = millis();
+            armChannelTimer(channel, cfg.pulseDurationMs);
           }
         } else {
-          level = LOW;
-          if (elapsedMs >= cfg.pulseDurationMs) {
-            cfg.pulseTrainInLowGap = false;
-            cfg.pulseStartMs = nowMs;
+          cfg.pulseTrainInLowGap = false;
+          cfg.pulseStartMs = millis();
+          cfg.lastLevel = true;
+          digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[channel], HIGH);
+          armChannelTimer(channel, cfg.pulseDurationMs);
+
+          if (cfg.pulsesRemaining == 0) {
+            cfg.mode = Runtime::OutputMode::Off;
+            cfg.lastLevel = false;
+            digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[channel], LOW);
+            clearChannelTimer(channel);
           }
         }
         break;
       }
 
       default:
-        level = LOW;
+        cfg.lastLevel = false;
+        digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[channel], LOW);
+        clearChannelTimer(channel);
         break;
-    }
-
-    if (level != cfg.lastLevel) {
-      digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[channel], level);
-      cfg.lastLevel = level;
     }
   }
 }
@@ -887,6 +1042,7 @@ void begin() {
   writeRow(1, "Booting...");
   writeRow(2, "");
   writeRow(3, "");
+  armLcdTimer(Config::LCD_REFRESH_MS);
 #endif
 }
 
@@ -896,11 +1052,10 @@ void update() {
     return;
   }
 
-  const uint32_t now = millis();
-  if ((now - Runtime::lastLcdRefreshMillis) < Config::LCD_REFRESH_MS) {
+  if (!consumeLcdTimerEvent()) {
     return;
   }
-  Runtime::lastLcdRefreshMillis = now;
+  armLcdTimer(Config::LCD_REFRESH_MS);
 
   char row0[32];
   snprintf(
@@ -936,8 +1091,10 @@ void update() {
 }  // namespace LcdDisplay
 
 void setup() {
-  pinMode(Config::RS485_DE_RE_PIN, OUTPUT);
-  rs485SetTransmit(false);
+  if (!Config::USE_USB_SERIAL) {
+    pinMode(Config::RS485_DE_RE_PIN, OUTPUT);
+    rs485SetTransmit(false);
+  }
 
   Config::RS485_SERIAL.begin(Config::RS485_BAUD);
 
@@ -976,7 +1133,9 @@ void setup() {
   Runtime::lastCommandMillis = millis();
   Runtime::lastModbusByteMillis = 0;
   Runtime::lastModbusError = Runtime::ModbusError::None;
-  Runtime::lastLcdRefreshMillis = 0;
+
+  setupChannelTimers();
+  setupLcdTimer();
 
   if (Config::ENABLE_DEBUG_LCD) {
     LcdDisplay::begin();

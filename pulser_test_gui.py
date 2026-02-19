@@ -22,6 +22,7 @@ import sys
 import json
 import csv
 import time
+import inspect
 import queue
 import threading
 from datetime import datetime
@@ -101,8 +102,18 @@ class ModbusManager(threading.Thread):
                 self.client.close()
             except Exception:
                 pass
-        self.client = ModbusClient(method="rtu", port=port, baudrate=baud, timeout=1)
-        ok = self.client.connect()
+        try:
+            try:
+                self.client = ModbusClient(port=port, framer="rtu", baudrate=baud, timeout=1, retries=1)
+            except TypeError:
+                self.client = ModbusClient(method="rtu", port=port, baudrate=baud, timeout=1)
+            ok = self.client.connect()
+        except Exception as e:
+            self.client = None
+            self.connected = False
+            self.ui_queue.put(("error", f"Connect failed: {e}"))
+            self.ui_queue.put(("connected", False))
+            return False
         self.connected = ok
         self.ui_queue.put(("connected", ok))
         return ok
@@ -123,6 +134,28 @@ class ModbusManager(threading.Thread):
     def enqueue_write(self, reg, value):
         self.cmd_queue.put(("write", reg, value))
 
+    def _write_register_compat(self, reg, val):
+        write_fn = self.client.write_register
+        sig = inspect.signature(write_fn)
+        if "device_id" in sig.parameters:
+            return write_fn(reg, int(val), device_id=self.unit)
+        if "unit" in sig.parameters:
+            return write_fn(reg, int(val), unit=self.unit)
+        if "slave" in sig.parameters:
+            return write_fn(reg, int(val), slave=self.unit)
+        return write_fn(reg, int(val))
+
+    def _read_holding_registers_compat(self, start, count):
+        read_fn = self.client.read_holding_registers
+        sig = inspect.signature(read_fn)
+        if "device_id" in sig.parameters:
+            return read_fn(start, count=count, device_id=self.unit)
+        if "unit" in sig.parameters:
+            return read_fn(start, count, unit=self.unit)
+        if "slave" in sig.parameters:
+            return read_fn(start, count, slave=self.unit)
+        return read_fn(start, count)
+
     def run(self):
         while not self._stop_event.is_set():
             # process queued commands first
@@ -132,7 +165,7 @@ class ModbusManager(threading.Thread):
                     if cmd[0] == "write" and self.client and self.connected:
                         _, reg, val = cmd
                         try:
-                            self.client.write_register(reg, int(val), unit=self.unit)
+                            self._write_register_compat(reg, val)
                             self.ui_queue.put(("wrote", reg, val))
                         except Exception as e:
                             self.ui_queue.put(("error", f"Write reg {reg}: {e}"))
@@ -145,7 +178,7 @@ class ModbusManager(threading.Thread):
                     regs = [0] * TOTAL_REGS
 
                     def read_block(start, count):
-                        rr = self.client.read_holding_registers(start, count, unit=self.unit)
+                        rr = self._read_holding_registers_compat(start, count)
                         if not rr or not hasattr(rr, 'registers'):
                             return False
                         vals = list(rr.registers)
@@ -176,9 +209,16 @@ class ModbusManager(threading.Thread):
 
 def scan_serial_ports():
     ports = list_ports.comports()
-    results = []
+    preferred = []
+    others = []
     for p in ports:
-        results.append(p.device)
+        desc = (getattr(p, "description", "") or "").lower()
+        hwid = (getattr(p, "hwid", "") or "").lower()
+        if any(tok in desc for tok in ("arduino", "usb serial", "ch340", "cp210")) or "vid:pid=2341" in hwid:
+            preferred.append(p.device)
+        else:
+            others.append(p.device)
+    results = preferred + others
     # common fallback patterns
     if not results:
         # try typical Linux names
@@ -224,8 +264,11 @@ class PulserApp(ctk.CTk):
         top.grid_columnconfigure(8, weight=0)
 
         ctk.CTkLabel(top, text="Port:").grid(row=0, column=0, sticky="w", padx=6)
-        self.port_cb = ctk.CTkComboBox(top, values=scan_serial_ports())
+        port_values = scan_serial_ports()
+        self.port_cb = ctk.CTkComboBox(top, values=port_values)
         self.port_cb.grid(row=0, column=1, padx=6, sticky="ew")
+        if port_values:
+            self.port_cb.set(port_values[0])
 
         ctk.CTkLabel(top, text="Baud:").grid(row=0, column=2, sticky="w", padx=6)
         self.baud_entry = ctk.CTkEntry(top, width=100)
@@ -385,6 +428,9 @@ class PulserApp(ctk.CTk):
     def _connect(self):
         if not self.modbus.connected:
             port = self.port_cb.get()
+            if not port:
+                messagebox.showerror("Connect", "No serial port selected")
+                return
             baud = int(self.baud_entry.get())
             unit = int(self.unit_entry.get())
             ok = self.modbus.connect(port, baud, unit)
