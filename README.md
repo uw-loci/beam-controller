@@ -24,7 +24,7 @@ The Beam Controller (BCON) acts as an intermediary device executing user command
   - `fault_latched` (`0` or `1`)
   - `telemetry_ms` (configured telemetry interval; `0` disables periodic telemetry)
 - **Status output (RS485 per channel)** - BCON transmits one `CHn` status line per pulser channel containing:
-  - `mode` (`OFF`, `DC`, `PULSE`)
+  - `mode` (`OFF`, `DC`, `PULSE`, `PULSE_TRAIN`)
   - `pulse_ms` (configured pulse duration)
   - `en_st` (enable status input)
   - `pwr_st` (power status input)
@@ -36,7 +36,7 @@ The Beam Controller (BCON) acts as an intermediary device executing user command
 For each pulser, the Arduino Mega outputs a 5V signal enabling the gate of a MOSFET. This allows sufficient current to be driven to the pulser gate from an external power source, enabling beam formation. BCON supports two output modes:
 
 1. **DC** - a constant 5V feed to the pulser gate, maintaining polarity until stopped.
-2. **Pulsed** - a pulse with the provided duration is output.
+2. **Pulsed** - a pulse with the provided duration is output. A pulse count can be provided to generate a pulse train; for count > 1, each pulse is `HIGH` for `duration_ms` followed by `LOW` for `duration_ms` until all pulses are complete.
 
 ## Safety Watchdog
 
@@ -90,11 +90,13 @@ flowchart TD
   M -- OFF --> M1[Channel output low]
   M -- DC --> M2[Channel output high]
   M -- PULSE --> M3{Pulse still active}
+  M -- PULSE_TRAIN --> M5[Alternate HIGH and LOW for each pulse duration]
   M3 -- Yes --> M2
   M3 -- No --> M4[Channel output low and mode off]
   M1 --> MW[Write outputs]
   M2 --> MW
   M4 --> MW
+  M5 --> MW
   MW --> D
 
   D --> P[RS485 parser service]
@@ -129,7 +131,7 @@ flowchart TD
 | SET TELEMETRY | `SET TELEMETRY <ms\|0>` | `0` disables; otherwise any `uint32` | `SET TELEMETRY 1000\n` | `OK TELEMETRY_UPDATED` or `ERR ...` | Errors: `ERR SET TELEMETRY <ms\|0>`, `ERR INVALID_TELEMETRY`. |
 | SET CH OFF | `SET CH <1..3> OFF` | Channel `1..3` | `SET CH 2 OFF\n` | `OK CH_OFF` or `ERR ...` | Blocked unless system state is READY (`ERR NOT_READY`). |
 | SET CH DC | `SET CH <1..3> DC` | Channel `1..3` | `SET CH 1 DC\n` | `OK CH_DC` or `ERR ...` | Blocked unless READY (`ERR NOT_READY`). |
-| SET CH PULSE | `SET CH <1..3> PULSE <duration_ms>` | Channel `1..3`; duration **1…60000 ms** | `SET CH 3 PULSE 250\n` | `OK CH_PULSE` or `ERR ...` | Errors: `ERR SET CH <n> PULSE <duration_ms>`, `ERR INVALID_DURATION`, `ERR DURATION_RANGE`, `ERR NOT_READY`. Pulse ends automatically and channel returns to OFF. |
+| SET CH PULSE | `SET CH <1..3> PULSE <duration_ms> [count]` | Channel `1..3`; duration **1…60000 ms**; count **1…10000** (optional, default `1`) | `SET CH 3 PULSE 250\n` or `SET CH 3 PULSE 250 5\n` | `OK CH_PULSE` / `OK CH_PULSE_TRAIN` or `ERR ...` | Errors: `ERR SET CH <n> PULSE <duration_ms>`, `ERR SET CH <n> PULSE <duration_ms> [count]`, `ERR INVALID_DURATION`, `ERR DURATION_RANGE`, `ERR INVALID_COUNT`, `ERR COUNT_RANGE`, `ERR NOT_READY`. For `count > 1`, pulses are `HIGH`/`LOW` alternating with equal `duration_ms` timing. |
 | CLEAR FAULT | `CLEAR FAULT` | none | `CLEAR FAULT\n` | `OK FAULT_CLEARED` or `ERR ...` | Also accepts `ARM` as an alias (same behavior). |
 | ARM | `ARM` | none | `ARM\n` | `OK FAULT_CLEARED` or `ERR ...` | Fails with `ERR FAULT_STILL_ACTIVE` if any OC status is still asserted, or `ERR INTERLOCK_NOT_READY` if interlock isn’t satisfied. |
 
