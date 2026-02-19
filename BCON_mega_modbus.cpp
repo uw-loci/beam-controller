@@ -11,14 +11,10 @@
 #define BCON_MODBUS_PORT Serial1
 #endif
 
-#ifndef BCON_ENABLE_I2C_LCD
 #define BCON_ENABLE_I2C_LCD 1
-#endif
 
-#if BCON_ENABLE_I2C_LCD
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#endif
 
 namespace Config {
 
@@ -60,6 +56,7 @@ constexpr size_t MODBUS_RX_BUFFER_SIZE = 256;
 constexpr uint32_t MODBUS_FRAME_GAP_MS = 4;
 
 constexpr bool ENABLE_DEBUG_LCD = (BCON_ENABLE_I2C_LCD != 0);
+constexpr bool ENABLE_LCD_INIT_DEBUG = true;
 constexpr uint8_t LCD_I2C_ADDRESS = 0x27;
 constexpr uint8_t LCD_COLS = 20;
 constexpr uint8_t LCD_ROWS = 4;
@@ -1005,23 +1002,60 @@ static void pollModbus() {
 namespace LcdDisplay {
 
 #if BCON_ENABLE_I2C_LCD
-LiquidCrystal_I2C lcd(Config::LCD_I2C_ADDRESS, Config::LCD_COLS, Config::LCD_ROWS);
+LiquidCrystal_I2C lcdPrimary(Config::LCD_I2C_ADDRESS, Config::LCD_COLS, Config::LCD_ROWS);
+LiquidCrystal_I2C *lcd = &lcdPrimary;
+bool lcdInitialized = false;
+bool lcdFirstUpdateLogged = false;
 char lineCache[Config::LCD_ROWS][Config::LCD_COLS + 1] = {{0}};
 
+static void lcdInitDebugPrint(const char *msg) {
+  if (!Config::ENABLE_LCD_INIT_DEBUG || msg == nullptr) {
+    return;
+  }
+  Serial.println(msg);
+}
+
+static void lcdInitDebugPrintAddress(const char *prefix, uint8_t address) {
+  if (!Config::ENABLE_LCD_INIT_DEBUG || prefix == nullptr) {
+    return;
+  }
+
+  char buf[40];
+  snprintf(buf, sizeof(buf), "%s0x%02X", prefix, address);
+  Serial.println(buf);
+}
+
+static void lcdInitDebugPrintRow(uint8_t row, const char *text) {
+  if (!Config::ENABLE_LCD_INIT_DEBUG || text == nullptr) {
+    return;
+  }
+
+  char buf[48];
+  snprintf(buf, sizeof(buf), "[LCD] row %u <= %s", static_cast<unsigned>(row), text);
+  Serial.println(buf);
+}
+
+static bool i2cAddressPresent(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
 static void writeRow(uint8_t row, const char *text) {
-  if (row >= Config::LCD_ROWS || text == nullptr) {
+  if (!lcdInitialized || row >= Config::LCD_ROWS || text == nullptr) {
     return;
   }
 
   char padded[Config::LCD_COLS + 1] = {0};
-  snprintf(
-    padded,
-    sizeof(padded),
-    "%-*.*s",
-    static_cast<int>(Config::LCD_COLS),
-    static_cast<int>(Config::LCD_COLS),
-    text
-  );
+  for (uint8_t i = 0; i < Config::LCD_COLS; ++i) {
+    padded[i] = ' ';
+  }
+  padded[Config::LCD_COLS] = '\0';
+
+  const size_t textLen = strlen(text);
+  const size_t copyLen = (textLen < Config::LCD_COLS) ? textLen : Config::LCD_COLS;
+  for (size_t i = 0; i < copyLen; ++i) {
+    padded[i] = text[i];
+  }
 
   if (strncmp(lineCache[row], padded, Config::LCD_COLS) == 0) {
     return;
@@ -1029,15 +1063,38 @@ static void writeRow(uint8_t row, const char *text) {
 
   strncpy(lineCache[row], padded, Config::LCD_COLS);
   lineCache[row][Config::LCD_COLS] = '\0';
-  lcd.setCursor(0, row);
-  lcd.print(padded);
+  lcd->setCursor(0, row);
+  lcd->print(padded);
+  lcdInitDebugPrintRow(row, padded);
 }
 #endif
 
 void begin() {
 #if BCON_ENABLE_I2C_LCD
-  lcd.init();
-  lcd.backlight();
+  lcdInitDebugPrint("[LCD] begin init");
+  Wire.begin();
+  lcdInitDebugPrint("[LCD] Wire.begin done");
+  lcdInitDebugPrintAddress("[LCD] probing address ", Config::LCD_I2C_ADDRESS);
+
+  if (i2cAddressPresent(Config::LCD_I2C_ADDRESS)) {
+    lcd = &lcdPrimary;
+    lcdInitDebugPrint("[LCD] address responded");
+  } else {
+    lcdInitialized = false;
+    lcdInitDebugPrint("[LCD] address not found");
+    return;
+  }
+
+  lcdInitDebugPrint("[LCD] calling lcd->init()");
+  lcd->init();
+  lcdInitDebugPrint("[LCD] enabling backlight");
+  lcd->backlight();
+  lcdInitDebugPrint("[LCD] clearing display");
+  lcd->clear();
+  lcdInitialized = true;
+  lcdFirstUpdateLogged = false;
+  lcdInitDebugPrint("[LCD] init complete");
+
   writeRow(0, "BCON Pulser Debug");
   writeRow(1, "Booting...");
   writeRow(2, "");
@@ -1055,6 +1112,12 @@ void update() {
   if (!consumeLcdTimerEvent()) {
     return;
   }
+
+  if (!lcdFirstUpdateLogged) {
+    lcdInitDebugPrint("[LCD] first update tick");
+    lcdFirstUpdateLogged = true;
+  }
+
   armLcdTimer(Config::LCD_REFRESH_MS);
 
   char row0[32];
@@ -1091,6 +1154,10 @@ void update() {
 }  // namespace LcdDisplay
 
 void setup() {
+  if (Config::ENABLE_LCD_INIT_DEBUG && !Config::USE_USB_SERIAL) {
+    Serial.begin(115200);
+  }
+
   if (!Config::USE_USB_SERIAL) {
     pinMode(Config::RS485_DE_RE_PIN, OUTPUT);
     rs485SetTransmit(false);

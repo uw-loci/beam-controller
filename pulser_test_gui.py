@@ -73,6 +73,12 @@ MODE_OFF = 0
 MODE_DC = 1
 MODE_PULSE = 2
 MODE_PULSE_TRAIN = 3
+MODE_LABEL_TO_CODE = {
+    "OFF": MODE_OFF,
+    "DC": MODE_DC,
+    "PULSE": MODE_PULSE,
+    "PULSE_TRAIN": MODE_PULSE_TRAIN,
+}
 
 # Default Modbus/settings
 DEFAULT_BAUD = 115200
@@ -312,44 +318,43 @@ class PulserApp(ctk.CTk):
             frame.grid_columnconfigure(3, weight=1)
             ctk.CTkLabel(frame, text=f"Channel {ch+1}", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, columnspan=4, sticky="w", pady=(4,8))
 
-            ctk.CTkLabel(frame, text="Width (ms):").grid(row=1, column=0, sticky="w")
-            w_entry = ctk.CTkEntry(frame)
-            w_entry.grid(row=1, column=1, padx=4, sticky="ew")
-
-            ctk.CTkLabel(frame, text="Interval (ms):").grid(row=1, column=2, sticky="w")
-            i_entry = ctk.CTkEntry(frame)
-            i_entry.grid(row=1, column=3, padx=4, sticky="ew")
-
-            ctk.CTkLabel(frame, text="Count:").grid(row=2, column=0, sticky="w", pady=(6,0))
-            cnt_entry = ctk.CTkEntry(frame)
-            cnt_entry.grid(row=2, column=1, pady=(6,0), sticky="ew")
-
-            ctk.CTkLabel(frame, text="Duration ms:").grid(row=2, column=2, sticky="w", pady=(6,0))
+            ctk.CTkLabel(frame, text="Duration (ms):").grid(row=1, column=0, sticky="w")
             dur_entry = ctk.CTkEntry(frame)
-            dur_entry.grid(row=2, column=3, pady=(6,0), sticky="ew")
+            dur_entry.grid(row=1, column=1, padx=4, sticky="ew")
+
+            ctk.CTkLabel(frame, text="Count:").grid(row=1, column=2, sticky="w")
+            cnt_entry = ctk.CTkEntry(frame)
+            cnt_entry.grid(row=1, column=3, padx=4, sticky="ew")
+
+            ctk.CTkLabel(frame, text="Mode:").grid(row=2, column=0, sticky="w", pady=(6,0))
+            mode_cb = ctk.CTkComboBox(frame, values=["OFF", "DC", "PULSE", "PULSE_TRAIN"])
+            mode_cb.set("PULSE")
+            mode_cb.grid(row=2, column=1, padx=4, pady=(6,0), sticky="ew")
 
             status_lbl = ctk.CTkLabel(frame, text="Status: idle", anchor="w")
             status_lbl.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8,4))
             pulses_lbl = ctk.CTkLabel(frame, text="Pulses: 0", anchor="w")
             pulses_lbl.grid(row=3, column=2, columnspan=2, sticky="w", pady=(8,4))
 
-            btn_write = ctk.CTkButton(frame, text="Write params", width=120, command=lambda ch=ch, w=w_entry, i=i_entry, cE=cnt_entry, d=dur_entry: self._write_params(ch, w, i, cE, d))
-            btn_write.grid(row=4, column=0, pady=6, sticky="ew")
-            btn_start = ctk.CTkButton(frame, text="Start", fg_color="#2ecc71", command=lambda ch=ch: self._send_cmd(ch, 1))
-            btn_start.grid(row=4, column=1, pady=6, padx=4, sticky="ew")
-            btn_stop = ctk.CTkButton(frame, text="Stop", fg_color="#e74c3c", command=lambda ch=ch: self._send_cmd(ch, 2))
+            btn_apply = ctk.CTkButton(frame, text="Apply Params + Mode", width=120, command=lambda ch=ch, cE=cnt_entry, d=dur_entry, m=mode_cb: self._apply_channel(ch, d, cE, m))
+            btn_apply.grid(row=4, column=0, columnspan=2, pady=6, padx=(0, 4), sticky="ew")
+            btn_stop = ctk.CTkButton(frame, text="Off", fg_color="#e74c3c", command=lambda ch=ch: self._set_mode(ch, MODE_OFF))
             btn_stop.grid(row=4, column=2, pady=6, padx=4, sticky="ew")
-            btn_single = ctk.CTkButton(frame, text="Single", command=lambda ch=ch: self._send_cmd(ch, 3))
-            btn_single.grid(row=4, column=3, pady=6, sticky="ew")
+            btn_dc = ctk.CTkButton(frame, text="DC", fg_color="#2ecc71", command=lambda ch=ch: self._set_mode(ch, MODE_DC))
+            btn_dc.grid(row=4, column=3, pady=6, sticky="ew")
+
+            btn_pulse = ctk.CTkButton(frame, text="Pulse", command=lambda ch=ch: self._set_mode(ch, MODE_PULSE))
+            btn_pulse.grid(row=5, column=0, columnspan=2, pady=(2, 6), padx=(0, 4), sticky="ew")
+            btn_train = ctk.CTkButton(frame, text="Pulse Train", command=lambda ch=ch: self._set_mode(ch, MODE_PULSE_TRAIN))
+            btn_train.grid(row=5, column=2, columnspan=2, pady=(2, 6), sticky="ew")
 
             btn_toggle = ctk.CTkButton(frame, text="Enable Toggle", command=lambda ch=ch: self._toggle_enable(ch))
-            btn_toggle.grid(row=5, column=0, columnspan=4, pady=(2, 6), sticky="ew")
+            btn_toggle.grid(row=6, column=0, columnspan=4, pady=(2, 6), sticky="ew")
 
             self.channel_vars.append({
-                'width': w_entry,
-                'interval': i_entry,
                 'count': cnt_entry,
                 'duration': dur_entry,
+                'mode': mode_cb,
                 'status': status_lbl,
                 'pulses': pulses_lbl
             })
@@ -361,8 +366,8 @@ class PulserApp(ctk.CTk):
         self.sync_ch_vars = [ctk.BooleanVar(value=False) for _ in range(3)]
         for ch in range(3):
             ctk.CTkCheckBox(sync_frame, text=f"CH{ch+1}", variable=self.sync_ch_vars[ch]).grid(row=1, column=ch)
-        self.sync_action = ctk.CTkComboBox(sync_frame, values=["start", "stop", "toggle"], width=140)
-        self.sync_action.set("start")
+        self.sync_action = ctk.CTkComboBox(sync_frame, values=["dc", "pulse", "train", "stop", "toggle"], width=140)
+        self.sync_action.set("pulse")
         self.sync_action.grid(row=1, column=3, padx=8)
         ctk.CTkButton(sync_frame, text="Send SYNC", command=self._send_sync).grid(row=2, column=0, columnspan=4, pady=8)
 
@@ -450,51 +455,45 @@ class PulserApp(ctk.CTk):
         except Exception as e:
             self._log_event(f"Theme change failed: {e}")
 
-    def _write_params(self, ch, w_entry, i_entry, cnt_entry, d_entry):
+    def _apply_channel(self, ch, d_entry, cnt_entry, mode_cb):
         try:
-            width = int(w_entry.get())
-            _interval = int(i_entry.get())
-            count = int(cnt_entry.get())
             duration = int(d_entry.get())
+            count = int(cnt_entry.get())
         except Exception:
             messagebox.showerror("Invalid", "Enter numeric values for parameters")
             return
 
-        pulse_ms = duration if duration > 0 else width
-        if pulse_ms <= 0:
+        if duration <= 0:
             messagebox.showerror("Invalid", "Pulse duration must be > 0")
             return
         if count <= 0:
             messagebox.showerror("Invalid", "Count must be > 0")
             return
 
+        mode_label = mode_cb.get().strip().upper()
+        if mode_label not in MODE_LABEL_TO_CODE:
+            messagebox.showerror("Invalid", f"Unsupported mode: {mode_label}")
+            return
+
         base = CH_BASE[ch]
-        self.modbus.enqueue_write(base + CH_PULSE_MS_OFF, pulse_ms)
+        self.modbus.enqueue_write(base + CH_PULSE_MS_OFF, duration)
         self.modbus.enqueue_write(base + CH_COUNT_OFF, count)
-        self._log_event(f"Wrote params CH{ch+1}: pulse_ms={pulse_ms} count={count}")
+        mode_code = MODE_LABEL_TO_CODE[mode_label]
+        self.modbus.enqueue_write(base + CH_MODE_OFF, mode_code)
+        self._log_event(f"Applied CH{ch+1}: mode={mode_label} duration_ms={duration} count={count}")
 
-    def _send_cmd(self, ch, cmd):
+    def _set_mode(self, ch, mode):
         base = CH_BASE[ch]
-
-        if cmd == 1:  # Start
-            count = self.modbus.last_regs[base + CH_COUNT_OFF]
-            mode = MODE_PULSE if count <= 1 else MODE_PULSE_TRAIN
-            self.modbus.enqueue_write(base + CH_MODE_OFF, mode)
-            self._log_event(f"CMD CH{ch+1} -> START (mode={mode})")
-            return
-
-        if cmd == 2:  # Stop
-            self.modbus.enqueue_write(base + CH_MODE_OFF, MODE_OFF)
-            self._log_event(f"CMD CH{ch+1} -> STOP")
-            return
-
-        if cmd == 3:  # Single
+        if mode == MODE_PULSE:
             self.modbus.enqueue_write(base + CH_COUNT_OFF, 1)
-            self.modbus.enqueue_write(base + CH_MODE_OFF, MODE_PULSE)
-            self._log_event(f"CMD CH{ch+1} -> SINGLE")
-            return
-
-        self._log_event(f"Unsupported command CH{ch+1} -> {cmd}")
+        self.modbus.enqueue_write(base + CH_MODE_OFF, mode)
+        mode_name = {
+            MODE_OFF: "OFF",
+            MODE_DC: "DC",
+            MODE_PULSE: "PULSE",
+            MODE_PULSE_TRAIN: "PULSE_TRAIN",
+        }.get(mode, str(mode))
+        self._log_event(f"CMD CH{ch+1} -> {mode_name}")
 
     def _toggle_enable(self, ch):
         base = CH_BASE[ch]
@@ -510,10 +509,18 @@ class PulserApp(ctk.CTk):
         action = self.sync_action.get()
         for ch in selected:
             base = CH_BASE[ch]
-            if action == 'start':
+            if action == 'dc':
+                self.modbus.enqueue_write(base + CH_MODE_OFF, MODE_DC)
+            elif action == 'pulse':
                 count = self.modbus.last_regs[base + CH_COUNT_OFF]
-                mode = MODE_PULSE if count <= 1 else MODE_PULSE_TRAIN
-                self.modbus.enqueue_write(base + CH_MODE_OFF, mode)
+                if count <= 0:
+                    self.modbus.enqueue_write(base + CH_COUNT_OFF, 1)
+                self.modbus.enqueue_write(base + CH_MODE_OFF, MODE_PULSE)
+            elif action == 'train':
+                count = self.modbus.last_regs[base + CH_COUNT_OFF]
+                if count < 2:
+                    self.modbus.enqueue_write(base + CH_COUNT_OFF, 2)
+                self.modbus.enqueue_write(base + CH_MODE_OFF, MODE_PULSE_TRAIN)
             elif action == 'stop':
                 self.modbus.enqueue_write(base + CH_MODE_OFF, MODE_OFF)
             else:  # toggle
@@ -601,10 +608,16 @@ class PulserApp(ctk.CTk):
         for ch in range(3):
             d = p.get(f'ch{ch+1}', {})
             pulse_ms = d.get('pulse_ms', 0)
-            self.channel_vars[ch]['width'].delete(0, 'end'); self.channel_vars[ch]['width'].insert(0, str(pulse_ms))
-            self.channel_vars[ch]['interval'].delete(0, 'end'); self.channel_vars[ch]['interval'].insert(0, "0")
             self.channel_vars[ch]['count'].delete(0, 'end'); self.channel_vars[ch]['count'].insert(0, str(d.get('count', 0)))
             self.channel_vars[ch]['duration'].delete(0, 'end'); self.channel_vars[ch]['duration'].insert(0, str(pulse_ms))
+            mode_code = int(d.get('mode', MODE_OFF))
+            mode_label = {
+                MODE_OFF: "OFF",
+                MODE_DC: "DC",
+                MODE_PULSE: "PULSE",
+                MODE_PULSE_TRAIN: "PULSE_TRAIN",
+            }.get(mode_code, "OFF")
+            self.channel_vars[ch]['mode'].set(mode_label)
         self._log_event(f"Loaded preset: {os.path.basename(fname)}")
 
     def _export_regs_csv(self):
@@ -679,21 +692,28 @@ class PulserApp(ctk.CTk):
                 pulse_ms = regs[base + CH_PULSE_MS_OFF]
                 count = regs[base + CH_COUNT_OFF]
                 # auto-fill entries only if user hasn't edited (naive approach)
-                self._safe_fill(self.channel_vars[ch]['width'], pulse_ms)
-                self._safe_fill(self.channel_vars[ch]['interval'], 0)
                 self._safe_fill(self.channel_vars[ch]['count'], count)
                 self._safe_fill(self.channel_vars[ch]['duration'], pulse_ms)
 
                 mode = regs[status_base + 0]
                 remaining = regs[status_base + 3]
+                output_level = regs[status_base + 8]
                 st_text = {
                     MODE_OFF: 'off',
                     MODE_DC: 'dc',
                     MODE_PULSE: 'pulse',
                     MODE_PULSE_TRAIN: 'pulse_train'
                 }.get(mode, 'unknown')
-                self.channel_vars[ch]['status'].configure(text=f"Status: {st_text}")
-                self.channel_vars[ch]['pulses'].configure(text=f"Remaining: {remaining}")
+                self.channel_vars[ch]['status'].configure(text=f"Status: {st_text} | O:{output_level}")
+                self.channel_vars[ch]['pulses'].configure(text=f"R:{remaining}")
+                mode_label = {
+                    MODE_OFF: "OFF",
+                    MODE_DC: "DC",
+                    MODE_PULSE: "PULSE",
+                    MODE_PULSE_TRAIN: "PULSE_TRAIN",
+                }.get(mode)
+                if mode_label:
+                    self.channel_vars[ch]['mode'].set(mode_label)
 
             interlock_ok = regs[REG_INTERLOCK_OK]
             watchdog_ok = regs[REG_WATCHDOG_OK]
