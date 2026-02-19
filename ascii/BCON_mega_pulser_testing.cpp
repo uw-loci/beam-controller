@@ -56,6 +56,8 @@ constexpr uint8_t GATED_STATUS_PINS[CHANNEL_COUNT] = {26, 30, 34};
 // ---------------------------
 constexpr uint32_t PULSE_DURATION_MIN_MS = 1;
 constexpr uint32_t PULSE_DURATION_MAX_MS = 60000;
+constexpr uint32_t PULSE_COUNT_MIN = 1;
+constexpr uint32_t PULSE_COUNT_MAX = 10000;
 
 }  // namespace Config
 
@@ -64,13 +66,17 @@ namespace Runtime {
 enum class OutputMode : uint8_t {
   Off = 0,
   DC,
-  Pulse
+  Pulse,
+  PulseTrain
 };
 
 struct ChannelControl {
   OutputMode mode = OutputMode::Off;
   uint32_t pulseDurationMs = 100;
+  uint32_t pulseCount = 1;
+  uint32_t pulsesRemaining = 0;
   uint32_t pulseStartMs = 0;
+  bool pulseTrainInLowGap = false;
   bool lastLevel = false;
 };
 
@@ -113,6 +119,7 @@ static const char *modeToString(Runtime::OutputMode mode) {
     case Runtime::OutputMode::Off: return "OFF";
     case Runtime::OutputMode::DC: return "DC";
     case Runtime::OutputMode::Pulse: return "PULSE";
+    case Runtime::OutputMode::PulseTrain: return "PULSE_TRAIN";
     default: return "UNKNOWN";
   }
 }
@@ -177,6 +184,43 @@ static void applyOutputs() {
         } else {
           level = LOW;
           cfg.mode = Runtime::OutputMode::Off;
+          cfg.pulsesRemaining = 0;
+        }
+        break;
+      }
+
+      case Runtime::OutputMode::PulseTrain: {
+        if (cfg.pulsesRemaining == 0) {
+          level = LOW;
+          cfg.mode = Runtime::OutputMode::Off;
+          cfg.pulseTrainInLowGap = false;
+          break;
+        }
+
+        const uint32_t nowMs = millis();
+        const uint32_t elapsedMs = nowMs - cfg.pulseStartMs;
+
+        if (!cfg.pulseTrainInLowGap) {
+          if (elapsedMs < cfg.pulseDurationMs) {
+            level = HIGH;
+          } else {
+            cfg.pulsesRemaining--;
+            if (cfg.pulsesRemaining == 0) {
+              level = LOW;
+              cfg.mode = Runtime::OutputMode::Off;
+              cfg.pulseTrainInLowGap = false;
+            } else {
+              level = LOW;
+              cfg.pulseTrainInLowGap = true;
+              cfg.pulseStartMs = nowMs;
+            }
+          }
+        } else {
+          level = LOW;
+          if (elapsedMs >= cfg.pulseDurationMs) {
+            cfg.pulseTrainInLowGap = false;
+            cfg.pulseStartMs = nowMs;
+          }
         }
         break;
       }
@@ -243,18 +287,35 @@ static void resetStatusTransitionCounters() {
 static void setChannelOff(uint8_t indexZeroBased) {
   Runtime::ChannelControl &cfg = Runtime::channels[indexZeroBased];
   cfg.mode = Runtime::OutputMode::Off;
+  cfg.pulsesRemaining = 0;
+  cfg.pulseTrainInLowGap = false;
 }
 
 static void setChannelDC(uint8_t indexZeroBased) {
   Runtime::ChannelControl &cfg = Runtime::channels[indexZeroBased];
   cfg.mode = Runtime::OutputMode::DC;
+  cfg.pulsesRemaining = 0;
+  cfg.pulseTrainInLowGap = false;
 }
 
 static void setChannelPulse(uint8_t indexZeroBased, uint32_t durationMs) {
   Runtime::ChannelControl &cfg = Runtime::channels[indexZeroBased];
   cfg.mode = Runtime::OutputMode::Pulse;
   cfg.pulseDurationMs = durationMs;
+  cfg.pulseCount = 1;
+  cfg.pulsesRemaining = 1;
   cfg.pulseStartMs = millis();
+  cfg.pulseTrainInLowGap = false;
+}
+
+static void setChannelPulseTrain(uint8_t indexZeroBased, uint32_t durationMs, uint32_t count) {
+  Runtime::ChannelControl &cfg = Runtime::channels[indexZeroBased];
+  cfg.mode = Runtime::OutputMode::PulseTrain;
+  cfg.pulseDurationMs = durationMs;
+  cfg.pulseCount = count;
+  cfg.pulsesRemaining = count;
+  cfg.pulseStartMs = millis();
+  cfg.pulseTrainInLowGap = false;
 }
 
 static void sendStatusReport() {
@@ -276,10 +337,12 @@ static void sendStatusReport() {
     snprintf(
       out,
       sizeof(out),
-      "CH%u mode=%s pulse_ms=%lu en_st=%u pwr_st=%u oc_st=%u gated_st=%u en_t=%lu pwr_t=%lu oc_t=%lu gated_t=%lu",
+      "CH%u mode=%s pulse_ms=%lu count=%lu remaining=%lu en_st=%u pwr_st=%u oc_st=%u gated_st=%u en_t=%lu pwr_t=%lu oc_t=%lu gated_t=%lu",
       c,
       modeToString(Runtime::channels[channel].mode),
       static_cast<unsigned long>(Runtime::channels[channel].pulseDurationMs),
+      static_cast<unsigned long>(Runtime::channels[channel].pulseCount),
+      static_cast<unsigned long>(Runtime::channels[channel].pulsesRemaining),
       st.en ? 1 : 0,
       st.pwr ? 1 : 0,
       st.oc ? 1 : 0,
@@ -334,7 +397,7 @@ static void processCommand(char *line) {
     sendLine("CMD STOP ALL");
     sendLine("CMD SET CH <1..3> OFF");
     sendLine("CMD SET CH <1..3> DC");
-    sendLine("CMD SET CH <1..3> PULSE <duration_ms>");
+    sendLine("CMD SET CH <1..3> PULSE <duration_ms> [count]");
     sendLine("CMD SET TELEMETRY <ms|0=off>");
     sendLine("CMD RESET COUNTS");
     return;
@@ -404,7 +467,7 @@ static void processCommand(char *line) {
 
       if (equalsIgnoreCase(tokens[3], "PULSE")) {
         if (tokenCount < 5) {
-          sendErr("SET CH <n> PULSE <duration_ms>");
+          sendErr("SET CH <n> PULSE <duration_ms> [count]");
           return;
         }
 
@@ -419,8 +482,25 @@ static void processCommand(char *line) {
           return;
         }
 
-        setChannelPulse(channel, durationMs);
-        sendOk("CH_PULSE");
+        uint32_t count = 1;
+        if (tokenCount >= 6) {
+          if (!parseUInt32(tokens[5], count)) {
+            sendErr("INVALID_COUNT");
+            return;
+          }
+          if (count < Config::PULSE_COUNT_MIN || count > Config::PULSE_COUNT_MAX) {
+            sendErr("COUNT_RANGE");
+            return;
+          }
+        }
+
+        if (count <= 1) {
+          setChannelPulse(channel, durationMs);
+          sendOk("CH_PULSE");
+        } else {
+          setChannelPulseTrain(channel, durationMs, count);
+          sendOk("CH_PULSE_TRAIN");
+        }
         return;
       }
 
@@ -482,7 +562,10 @@ void setup() {
 
     Runtime::channels[channel].mode = Runtime::OutputMode::Off;
     Runtime::channels[channel].pulseDurationMs = 100;
+    Runtime::channels[channel].pulseCount = 1;
+    Runtime::channels[channel].pulsesRemaining = 0;
     Runtime::channels[channel].pulseStartMs = millis();
+    Runtime::channels[channel].pulseTrainInLowGap = false;
     Runtime::channels[channel].lastLevel = false;
   }
 
