@@ -13,8 +13,10 @@ Modbus is the **primary firmware driver**. ASCII command firmware is treated as 
 
 ## Serial / Modbus Settings
 
-- Interface: RS485 half-duplex (`DE + /RE` tied to `D2`)
-- UART: `Serial1` on Mega (`TX1=D18`, `RX1=D19`)
+- UART selection is compile-time controlled by `BCON_MODBUS_USE_USB_SERIAL`:
+  - `1` (current default): Modbus on `Serial` (USB CDC/UART)
+  - `0`: Modbus on `Serial1` (`TX1=D18`, `RX1=D19`)
+- RS485 direction pin (`DE + /RE` on `D2`) is used when `Serial1` mode is selected
 - Baud: `115200`
 - Slave ID: `1` (broadcast supported on ID `0` for writes)
 - Frame type: Modbus RTU, CRC16 (little-endian CRC bytes)
@@ -28,7 +30,8 @@ Modbus is the **primary firmware driver**. ASCII command firmware is treated as 
 - CH1 enable-toggle output: `D8`
 - CH2 enable-toggle output: `D9`
 - CH3 enable-toggle output: `D10`
-- Behavior: writing the channel enable-toggle register with value `1` sends a momentary pulse on that pin.
+- Behavior: writing the channel enable-toggle register with value `1` starts a timed pulse on that pin.
+- Pulse timing is non-blocking (timer-driven) and does not stall Modbus frame handling.
 - Safety integration: when a non-`OFF` mode is commanded and enable status is not asserted, firmware issues an enable-toggle pulse before altering gate outputs.
 
 ## Value Enums
@@ -112,7 +115,7 @@ For non-`OFF` mode requests, firmware also checks each channel enable-status inp
 
 ```mermaid
 flowchart TD
-  A[Power On or Reset] --> B[Initialize IO and RS485/Serial1]
+  A[Power On or Reset] --> B[Initialize IO, RS485/Serial1, and Timers]
   B --> C[Enter main loop]
 
   C --> D[Poll Modbus RTU frames]
