@@ -1,137 +1,127 @@
-# Beam Controller (BCON)
+# BCON Modbus Firmware
 
-## Description
+This repository is centered on the Modbus RTU Beam Controller firmware:
+- `BCON_mega_modbus.cpp`
 
-The Beam Controller (BCON) acts as an intermediary device executing user commands from the dashboard by directly interfacing with crucial hardware components inside the lead enclosure during experimentation. The BCON system interfaces with each of three pulsers, setting the polarity on the grids and either allowing or preventing the formation of an electron beam. At the same time, the system monitors a safety interlock signal and 4 status signals from each of the pulsers.
+Modbus is the **primary firmware driver**. ASCII command firmware is treated as legacy/secondary, and all active control/status communication is via Modbus RTU.
 
-## Inputs
+## Firmware Priority
 
-- **KB_Interlock** - when low (0), pulser output should be 0. When high (1), pulser output can be remotely enabled.
-- **Dashboard serial communication over RS485** - the actions of BCON are primarily driven by user-controlled software on a Python dashboard. The dashboard sets pulser output behavior as described in **Pulser Output Behavior**.
-- **Pulser status signals** - one status signal set for each of the three pulsers:
-  - Enable status
-  - Power status
-  - Over-current status
-  - Gated status
+- Primary: Modbus RTU firmware (`BCON_mega_modbus.cpp`)
+- Legacy/secondary: ASCII command firmware
+- New dashboard/control integrations should target the Modbus register interface.
 
-## Outputs
+## Serial / Modbus Settings
 
-- **Pulser output** - one output for each of the three pulsers as described in **Pulser Output Behavior**.
-- **Power LED** - an external chassis power LED should be fed when the Arduino is powered.
-- **Telemetry data output (RS485)** - BCON periodically transmits system-level telemetry to the dashboard. The `SYS` line reports controller state and timing fields:
-  - `state` (`READY`, `SAFE_INTERLOCK`, `SAFE_WATCHDOG`, `FAULT_LATCHED`)
-  - `reason` (`NONE`, `INTERLOCK_LOW`, `WATCHDOG_EXPIRED`, `FAULT_LATCHED`)
-  - `fault_latched` (`0` or `1`)
-  - `telemetry_ms` (configured telemetry interval; `0` disables periodic telemetry)
-- **Status output (RS485 per channel)** - BCON transmits one `CHn` status line per pulser channel containing:
-  - `mode` (`OFF`, `DC`, `PULSE`, `PULSE_TRAIN`)
-  - `pulse_ms` (configured pulse duration)
-  - `en_st` (enable status input)
-  - `pwr_st` (power status input)
-  - `oc_st` (over-current status input)
-  - `gated_st` (gated status input)
+- Interface: RS485 half-duplex (`DE + /RE` tied to `D2`)
+- UART: `Serial1` on Mega (`TX1=D18`, `RX1=D19`)
+- Baud: `115200`
+- Slave ID: `1` (broadcast supported on ID `0` for writes)
+- Frame type: Modbus RTU, CRC16 (little-endian CRC bytes)
+- Supported function codes:
+  - `0x03` Read Holding Registers
+  - `0x06` Write Single Register
+  - `0x10` Write Multiple Registers
 
-## Pulser Output Behavior
+## Value Enums
 
-For each pulser, the Arduino Mega outputs a 5V signal enabling the gate of a MOSFET. This allows sufficient current to be driven to the pulser gate from an external power source, enabling beam formation. BCON supports two output modes:
+- Channel mode values (`CHx_MODE`):
+  - `0` = `OFF`
+  - `1` = `DC`
+  - `2` = `PULSE` (single pulse if `count <= 1`, otherwise pulse train)
+  - `3` = `PULSE_TRAIN` (requires `count >= 2`)
+- System state (`REG_SYS_STATE`):
+  - `0` = `READY`
+  - `1` = `SAFE_INTERLOCK`
+  - `2` = `SAFE_WATCHDOG`
+  - `3` = `FAULT_LATCHED`
+- System reason (`REG_SYS_REASON`):
+  - `0` = none
+  - `1` = interlock low
+  - `2` = watchdog expired
+  - `3` = fault latched
+- Last error (`REG_LAST_ERROR`):
+  - `0` none, `1` illegal function, `2` illegal address, `3` illegal value, `4` device failure,
+    `10` not ready, `11` fault still active, `12` interlock not ready, `13` RX buffer overflow
 
-1. **DC** - a constant 5V feed to the pulser gate, maintaining polarity until stopped.
-2. **Pulsed** - a pulse with the provided duration is output. A pulse count can be provided to generate a pulse train; for count > 1, each pulse is `HIGH` for `duration_ms` followed by `LOW` for `duration_ms` until all pulses are complete.
+## Register Map (Holding Registers)
 
-## Safety Watchdog
+| Address | Name | R/W | Description |
+|---:|---|:---:|---|
+| `0` | `REG_WATCHDOG_MS` | R/W | Watchdog timeout in ms (`50..60000`) |
+| `1` | `REG_TELEMETRY_MS` | R/W | Telemetry period in ms (stored; Modbus firmware does not auto-push telemetry) |
+| `2` | `REG_COMMAND` | R/W | Command register (write actions below; reads as `0`) |
+| `10` | `REG_CH1_MODE` | R/W | Channel 1 mode command/state |
+| `11` | `REG_CH1_PULSE_MS` | R/W | Channel 1 pulse duration in ms (`1..60000`) |
+| `12` | `REG_CH1_COUNT` | R/W | Channel 1 pulse count (`1..10000`) |
+| `20` | `REG_CH2_MODE` | R/W | Channel 2 mode command/state |
+| `21` | `REG_CH2_PULSE_MS` | R/W | Channel 2 pulse duration in ms (`1..60000`) |
+| `22` | `REG_CH2_COUNT` | R/W | Channel 2 pulse count (`1..10000`) |
+| `30` | `REG_CH3_MODE` | R/W | Channel 3 mode command/state |
+| `31` | `REG_CH3_PULSE_MS` | R/W | Channel 3 pulse duration in ms (`1..60000`) |
+| `32` | `REG_CH3_COUNT` | R/W | Channel 3 pulse count (`1..10000`) |
+| `100` | `REG_SYS_STATE` | R | Top-level state code |
+| `101` | `REG_SYS_REASON` | R | Top-level reason code |
+| `102` | `REG_FAULT_LATCHED` | R | `1` if fault latched |
+| `103` | `REG_INTERLOCK_OK` | R | `1` if interlock satisfied |
+| `104` | `REG_WATCHDOG_OK` | R | `1` if watchdog healthy |
+| `105` | `REG_LAST_ERROR` | R | Last Modbus/internal error code |
+| `110` | `CH1_STATUS_MODE` | R | Live mode code |
+| `111` | `CH1_STATUS_PULSE_MS` | R | Live pulse duration |
+| `112` | `CH1_STATUS_COUNT` | R | Configured pulse count |
+| `113` | `CH1_STATUS_REMAINING` | R | Pulses remaining in active train |
+| `114` | `CH1_STATUS_EN` | R | Enable status input (`active-low` interpreted as `1`) |
+| `115` | `CH1_STATUS_PWR` | R | Power status input (`active-low` interpreted as `1`) |
+| `116` | `CH1_STATUS_OC` | R | Over-current input (`active-low` interpreted as `1`) |
+| `117` | `CH1_STATUS_GATED` | R | Gated status input (`active-low` interpreted as `1`) |
+| `118` | `CH1_STATUS_GATE_OUT` | R | Current output level (`1`=HIGH) |
+| `120..128` | `CH2_STATUS_*` | R | Same layout as CH1 |
+| `130..138` | `CH3_STATUS_*` | R | Same layout as CH1 |
 
-If communication is lost between the Python dashboard and BCON, the pulsers must return to negative polarity and the gate must not remain active. The watchdog timing should be easy to adjust.
+## Command Register (`REG_COMMAND`) Writes
 
-## Expected Pinout (Current Firmware)
+- `0`: no-op
+- `1`: `STOP ALL` (all channels off)
+- `2`: clear fault latch (`CLEAR FAULT` equivalent)
+- `3`: arm (`ARM` equivalent; currently same behavior as `2`)
 
-- `D2` -> RS485 transceiver `DE + /RE` (tied together, TX/RX direction control)
-- `D18 (TX1)` / `D19 (RX1)` -> RS485 UART (`Serial1`) to transceiver `DI/RO`
-- `D13` -> external chassis power LED (set `HIGH` in setup)
-- `D22` -> `KB_Interlock` input (`HIGH` = outputs allowed, `LOW` = force outputs `LOW`)
+Both `2` and `3` fail if over-current is still active or interlock is not ready.
 
-### Pulser Gate Outputs
+## Typical Write Sequence (Pulse Train)
 
-- Channel 1 gate output: `D5`
-- Channel 2 gate output: `D6`
-- Channel 3 gate output: `D7`
+1. Write `CHx_PULSE_MS`
+2. Write `CHx_COUNT`
+3. Write `CHx_MODE = 3` (explicit train) or `2` (auto single/train based on count)
 
-### Pulser Status Inputs (Active-Low, Open-Drain)
+Safety gating still applies: non-`OFF` mode requests are rejected unless system state is `READY`.
 
-- Channel 1: `EN D23`, `PWR D24`, `OC D25`, `GATED D26`
-- Channel 2: `EN D27`, `PWR D28`, `OC D29`, `GATED D30`
-- Channel 3: `EN D31`, `PWR D32`, `OC D33`, `GATED D34`
-
-## Electrical Behavior Assumptions
-
-- Status pins are configured as `INPUT_PULLUP` (so open-drain low = asserted/true).
-- Interlock pin is plain `INPUT` (no internal pull-up enabled in current config).
-- Gate outputs are logic-level digital outputs (`LOW` at startup, fail-safe `LOW` on watchdog/interlock fault).
-
-## Operation Flowchart
+## Operation Flowchart (Modbus Primary)
 
 ```mermaid
 flowchart TD
-  A[Power On or Reset] --> B[BOOT setup initialize hardware]
-  B --> C[Announce READY on RS485]
-  C --> D[Main control loop]
+  A[Power On or Reset] --> B[Initialize IO and RS485/Serial1]
+  B --> C[Enter main loop]
 
-  D --> E{Top level state evaluation}
-  E -- Interlock low --> S1[SAFE_INTERLOCK force outputs off]
-  E -- Watchdog expired --> S2[SAFE_WATCHDOG force outputs off]
-  E -- Fault latch set --> S3[FAULT_LATCHED optional force outputs off]
-  E -- Interlock high and watchdog healthy --> R[READY]
+  C --> D[Poll Modbus RTU frames]
+  D --> E{Valid frame for this slave ID?}
+  E -- No --> C
+  E -- Yes --> F[Process function code 0x03/0x06/0x10]
+  F --> G[Read/write holding registers]
+  G --> H[Update command/state fields]
 
-  S1 --> SF[Outputs forced low]
-  S2 --> SF
-  S3 --> SF
-  SF --> D
+  H --> I{Top-level safety state}
+  I -- Interlock low --> I1[SAFE_INTERLOCK force outputs LOW]
+  I -- Watchdog expired --> I2[SAFE_WATCHDOG force outputs LOW]
+  I -- Fault latched --> I3[FAULT_LATCHED force outputs LOW]
+  I -- Ready --> J[Apply per-channel mode]
 
-  R --> M{Per channel mode micro FSM}
-  M -- OFF --> M1[Channel output low]
-  M -- DC --> M2[Channel output high]
-  M -- PULSE --> M3{Pulse still active}
-  M -- PULSE_TRAIN --> M5[Alternate HIGH and LOW for each pulse duration]
-  M3 -- Yes --> M2
-  M3 -- No --> M4[Channel output low and mode off]
-  M1 --> MW[Write outputs]
-  M2 --> MW
-  M4 --> MW
-  M5 --> MW
-  MW --> D
+  J --> J1[OFF = LOW]
+  J --> J2[DC = HIGH]
+  J --> J3[PULSE / PULSE_TRAIN timing]
+  J1 --> K[Write outputs if changed]
+  J2 --> K
+  J3 --> K
 
-  D --> P[RS485 parser service]
-  P --> PC{Command received}
-  PC -- SET CH and state READY --> PA[Accept command and update channel mode]
-  PC -- SET CH and state not READY --> PR[Reject command or defer]
-  PC -- CLEAR FAULT or ARM --> PL[Clear latch when conditions valid]
-  PC -- Other valid command --> PO[Handle command]
-  PA --> D
-  PR --> D
-  PL --> D
-  PO --> D
-
-  D --> T[Telemetry service periodic]
-  T --> TS{Current top level state}
-  TS -- READY --> T1[Normal telemetry]
-  TS -- SAFE or FAULT --> T2[Telemetry includes fault reason]
-  T1 --> D
-  T2 --> D
+  K --> L[Update status registers]
+  L --> C
 ```
-
-## RS-485 Command Structure
-
-| Command | Structure (tokens) | Args / Ranges | Example | Typical response | Notes |
-| ------------- | ----------------------------------- | --------------------------------------- | ---------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| PING | `PING` | none | `PING\n` | `PONG` | Also refreshes comm watchdog because any complete line updates `lastCommandMillis`. |
-| HELP | `HELP` | none | `HELP\n` | Multiple `CMD ...` lines | Prints the supported command list. |
-| STATUS | `STATUS` | none | `STATUS\n` | Multi-line report | System + per-channel report. |
-| GET STATUS | `GET STATUS` | none | `GET STATUS\n` | Multi-line report | Same as `STATUS`. |
-| STOP ALL | `STOP ALL` | none | `STOP ALL\n` | `OK ALL_OFF` | Forces all channels to OFF mode. |
-| SET WATCHDOG | `SET WATCHDOG <ms>` | `ms` must be **50…60000** | `SET WATCHDOG 1000\n` | `OK WATCHDOG_UPDATED` or `ERR ...` | Errors: `ERR SET WATCHDOG <ms>`, `ERR INVALID_WATCHDOG`, `ERR WATCHDOG_RANGE`. |
-| SET TELEMETRY | `SET TELEMETRY <ms\|0>` | `0` disables; otherwise any `uint32` | `SET TELEMETRY 1000\n` | `OK TELEMETRY_UPDATED` or `ERR ...` | Errors: `ERR SET TELEMETRY <ms\|0>`, `ERR INVALID_TELEMETRY`. |
-| SET CH OFF | `SET CH <1..3> OFF` | Channel `1..3` | `SET CH 2 OFF\n` | `OK CH_OFF` or `ERR ...` | Blocked unless system state is READY (`ERR NOT_READY`). |
-| SET CH DC | `SET CH <1..3> DC` | Channel `1..3` | `SET CH 1 DC\n` | `OK CH_DC` or `ERR ...` | Blocked unless READY (`ERR NOT_READY`). |
-| SET CH PULSE | `SET CH <1..3> PULSE <duration_ms> [count]` | Channel `1..3`; duration **1…60000 ms**; count **1…10000** (optional, default `1`) | `SET CH 3 PULSE 250\n` or `SET CH 3 PULSE 250 5\n` | `OK CH_PULSE` / `OK CH_PULSE_TRAIN` or `ERR ...` | Errors: `ERR SET CH <n> PULSE <duration_ms>`, `ERR SET CH <n> PULSE <duration_ms> [count]`, `ERR INVALID_DURATION`, `ERR DURATION_RANGE`, `ERR INVALID_COUNT`, `ERR COUNT_RANGE`, `ERR NOT_READY`. For `count > 1`, pulses are `HIGH`/`LOW` alternating with equal `duration_ms` timing. |
-| CLEAR FAULT | `CLEAR FAULT` | none | `CLEAR FAULT\n` | `OK FAULT_CLEARED` or `ERR ...` | Also accepts `ARM` as an alias (same behavior). |
-| ARM | `ARM` | none | `ARM\n` | `OK FAULT_CLEARED` or `ERR ...` | Fails with `ERR FAULT_STILL_ACTIVE` if any OC status is still asserted, or `ERR INTERLOCK_NOT_READY` if interlock isn’t satisfied. |
-
