@@ -18,9 +18,10 @@ constexpr uint8_t KB_INTERLOCK_PIN = 22;
 constexpr bool INTERLOCK_ACTIVE_HIGH = true;
 constexpr bool INTERLOCK_USE_PULLUP = false;
 
-constexpr uint8_t POWER_LED_PIN = 13;
-
 constexpr uint8_t PULSER_GATE_OUTPUT_PINS[CHANNEL_COUNT] = {5, 6, 7};
+constexpr uint8_t PULSER_ENABLE_TOGGLE_OUTPUT_PINS[CHANNEL_COUNT] = {8, 9, 10};
+constexpr bool ENABLE_TOGGLE_ACTIVE_HIGH = true;
+constexpr uint16_t ENABLE_TOGGLE_PULSE_MS = 100;
 
 constexpr bool STATUS_USE_INTERNAL_PULLUPS = true;
 
@@ -100,14 +101,17 @@ constexpr uint16_t REG_COMMAND = 2;
 constexpr uint16_t REG_CH1_MODE = 10;
 constexpr uint16_t REG_CH1_PULSE_MS = 11;
 constexpr uint16_t REG_CH1_COUNT = 12;
+constexpr uint16_t REG_CH1_ENABLE_TOGGLE = 13;
 
 constexpr uint16_t REG_CH2_MODE = 20;
 constexpr uint16_t REG_CH2_PULSE_MS = 21;
 constexpr uint16_t REG_CH2_COUNT = 22;
+constexpr uint16_t REG_CH2_ENABLE_TOGGLE = 23;
 
 constexpr uint16_t REG_CH3_MODE = 30;
 constexpr uint16_t REG_CH3_PULSE_MS = 31;
 constexpr uint16_t REG_CH3_COUNT = 32;
+constexpr uint16_t REG_CH3_ENABLE_TOGGLE = 33;
 
 constexpr uint16_t REG_SYS_STATE = 100;
 constexpr uint16_t REG_SYS_REASON = 101;
@@ -185,6 +189,16 @@ static uint16_t modeToCode(Runtime::OutputMode mode) {
 
 static void setModbusError(Runtime::ModbusError error) {
   Runtime::lastModbusError = error;
+}
+
+static void pulseEnableToggle(uint8_t channelIndex) {
+  const uint8_t pin = Config::PULSER_ENABLE_TOGGLE_OUTPUT_PINS[channelIndex];
+  const uint8_t activeLevel = Config::ENABLE_TOGGLE_ACTIVE_HIGH ? HIGH : LOW;
+  const uint8_t inactiveLevel = Config::ENABLE_TOGGLE_ACTIVE_HIGH ? LOW : HIGH;
+
+  digitalWrite(pin, activeLevel);
+  delay(Config::ENABLE_TOGGLE_PULSE_MS);
+  digitalWrite(pin, inactiveLevel);
 }
 
 static void rs485SetTransmit(bool enabled) {
@@ -359,14 +373,14 @@ static void applyOutputs() {
 }
 
 static bool decodeChannelControlRegister(uint16_t reg, uint8_t &channelIndex, uint8_t &field) {
-  if (reg < 10 || reg > 32) {
+  if (reg < 10 || reg > 33) {
     return false;
   }
 
   const uint8_t decade = static_cast<uint8_t>(reg / 10);
   const uint8_t units = static_cast<uint8_t>(reg % 10);
 
-  if (decade < 1 || decade > 3 || units > 2) {
+  if (decade < 1 || decade > 3 || units > 3) {
     return false;
   }
 
@@ -441,6 +455,10 @@ static bool readHoldingRegister(uint16_t reg, uint16_t &valueOut) {
     }
     if (field == 2) {
       valueOut = static_cast<uint16_t>(cfg.pulseCount);
+      return true;
+    }
+    if (field == 3) {
+      valueOut = 0;
       return true;
     }
   }
@@ -547,6 +565,17 @@ static bool writeHoldingRegister(uint16_t reg, uint16_t value, uint8_t &exceptio
     return true;
   }
 
+  if (field == 3) {
+    if (value != 1) {
+      setModbusError(Runtime::ModbusError::IllegalValue);
+      return false;
+    }
+
+    pulseEnableToggle(channel);
+    setModbusError(Runtime::ModbusError::None);
+    return true;
+  }
+
   if (field == 0) {
     const Runtime::TopLevelState state = evaluateTopLevelState();
 
@@ -563,12 +592,18 @@ static bool writeHoldingRegister(uint16_t reg, uint16_t value, uint8_t &exceptio
     }
 
     if (value == 1) {
+      if (!activeLowRead(Config::ENABLE_STATUS_PINS[channel])) {
+        pulseEnableToggle(channel);
+      }
       setChannelDC(channel);
       setModbusError(Runtime::ModbusError::None);
       return true;
     }
 
     if (value == 2) {
+      if (!activeLowRead(Config::ENABLE_STATUS_PINS[channel])) {
+        pulseEnableToggle(channel);
+      }
       if (cfg.pulseCount <= 1) {
         setChannelPulse(channel, cfg.pulseDurationMs);
       } else {
@@ -582,6 +617,9 @@ static bool writeHoldingRegister(uint16_t reg, uint16_t value, uint8_t &exceptio
       if (cfg.pulseCount < 2) {
         setModbusError(Runtime::ModbusError::IllegalValue);
         return false;
+      }
+      if (!activeLowRead(Config::ENABLE_STATUS_PINS[channel])) {
+        pulseEnableToggle(channel);
       }
       setChannelPulseTrain(channel, cfg.pulseDurationMs, cfg.pulseCount);
       setModbusError(Runtime::ModbusError::None);
@@ -782,9 +820,6 @@ void setup() {
 
   Config::RS485_SERIAL.begin(Config::RS485_BAUD);
 
-  pinMode(Config::POWER_LED_PIN, OUTPUT);
-  digitalWrite(Config::POWER_LED_PIN, HIGH);
-
   pinMode(
     Config::KB_INTERLOCK_PIN,
     Config::INTERLOCK_USE_PULLUP ? INPUT_PULLUP : INPUT
@@ -793,6 +828,12 @@ void setup() {
   for (uint8_t channel = 0; channel < Config::CHANNEL_COUNT; ++channel) {
     pinMode(Config::PULSER_GATE_OUTPUT_PINS[channel], OUTPUT);
     digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[channel], LOW);
+
+    pinMode(Config::PULSER_ENABLE_TOGGLE_OUTPUT_PINS[channel], OUTPUT);
+    digitalWrite(
+      Config::PULSER_ENABLE_TOGGLE_OUTPUT_PINS[channel],
+      Config::ENABLE_TOGGLE_ACTIVE_HIGH ? LOW : HIGH
+    );
 
     Runtime::channels[channel].mode = Runtime::OutputMode::Off;
     Runtime::channels[channel].pulseDurationMs = 100;
