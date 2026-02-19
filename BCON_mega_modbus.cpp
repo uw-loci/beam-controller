@@ -1,4 +1,14 @@
 #include <Arduino.h>
+#include <string.h>
+
+#ifndef BCON_ENABLE_I2C_LCD
+#define BCON_ENABLE_I2C_LCD 0
+#endif
+
+#if BCON_ENABLE_I2C_LCD
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#endif
 
 namespace Config {
 
@@ -37,6 +47,17 @@ constexpr uint32_t PULSE_COUNT_MAX = 10000;
 
 constexpr size_t MODBUS_RX_BUFFER_SIZE = 256;
 constexpr uint32_t MODBUS_FRAME_GAP_MS = 4;
+
+constexpr bool ENABLE_DEBUG_LCD = (BCON_ENABLE_I2C_LCD != 0);
+constexpr uint8_t LCD_I2C_ADDRESS = 0x27;
+constexpr uint8_t LCD_COLS = 20;
+constexpr uint8_t LCD_ROWS = 4;
+constexpr uint32_t LCD_REFRESH_MS = 250;
+
+constexpr const char *LCD_LABEL_WATCHDOG = "WDG";
+constexpr const char *LCD_LABEL_INTERLOCK = "INT";
+constexpr const char *LCD_LABEL_FAULT = "FLT";
+constexpr const char *LCD_LABEL_CHANNELS[CHANNEL_COUNT] = {"CH1", "CH2", "CH3"};
 
 }  // namespace Config
 
@@ -89,6 +110,8 @@ ModbusError lastModbusError = ModbusError::None;
 uint8_t modbusRxBuffer[Config::MODBUS_RX_BUFFER_SIZE] = {0};
 size_t modbusRxIndex = 0;
 uint32_t lastModbusByteMillis = 0;
+
+uint32_t lastLcdRefreshMillis = 0;
 
 }  // namespace Runtime
 
@@ -145,6 +168,16 @@ static bool isAnyOverCurrentAsserted() {
     }
   }
   return false;
+}
+
+static const char *modeToShortString(Runtime::OutputMode mode) {
+  switch (mode) {
+    case Runtime::OutputMode::Off: return "OFF";
+    case Runtime::OutputMode::DC: return "DC ";
+    case Runtime::OutputMode::Pulse: return "PUL";
+    case Runtime::OutputMode::PulseTrain: return "TRN";
+    default: return "UNK";
+  }
 }
 
 static Runtime::TopLevelState evaluateTopLevelState() {
@@ -814,6 +847,94 @@ static void pollModbus() {
   }
 }
 
+namespace LcdDisplay {
+
+#if BCON_ENABLE_I2C_LCD
+LiquidCrystal_I2C lcd(Config::LCD_I2C_ADDRESS, Config::LCD_COLS, Config::LCD_ROWS);
+char lineCache[Config::LCD_ROWS][Config::LCD_COLS + 1] = {{0}};
+
+static void writeRow(uint8_t row, const char *text) {
+  if (row >= Config::LCD_ROWS || text == nullptr) {
+    return;
+  }
+
+  char padded[Config::LCD_COLS + 1] = {0};
+  snprintf(
+    padded,
+    sizeof(padded),
+    "%-*.*s",
+    static_cast<int>(Config::LCD_COLS),
+    static_cast<int>(Config::LCD_COLS),
+    text
+  );
+
+  if (strncmp(lineCache[row], padded, Config::LCD_COLS) == 0) {
+    return;
+  }
+
+  strncpy(lineCache[row], padded, Config::LCD_COLS);
+  lineCache[row][Config::LCD_COLS] = '\0';
+  lcd.setCursor(0, row);
+  lcd.print(padded);
+}
+#endif
+
+void begin() {
+#if BCON_ENABLE_I2C_LCD
+  lcd.init();
+  lcd.backlight();
+  writeRow(0, "BCON Pulser Debug");
+  writeRow(1, "Booting...");
+  writeRow(2, "");
+  writeRow(3, "");
+#endif
+}
+
+void update() {
+#if BCON_ENABLE_I2C_LCD
+  if (!Config::ENABLE_DEBUG_LCD) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if ((now - Runtime::lastLcdRefreshMillis) < Config::LCD_REFRESH_MS) {
+    return;
+  }
+  Runtime::lastLcdRefreshMillis = now;
+
+  char row0[32];
+  snprintf(
+    row0,
+    sizeof(row0),
+    "%s:%s %s:%s %s:%u",
+    Config::LCD_LABEL_WATCHDOG,
+    isWatchdogHealthy() ? "OK" : "BAD",
+    Config::LCD_LABEL_INTERLOCK,
+    isInterlockSatisfied() ? "OK" : "BAD",
+    Config::LCD_LABEL_FAULT,
+    Runtime::faultLatched ? 1 : 0
+  );
+  writeRow(0, row0);
+
+  for (uint8_t channel = 0; channel < Config::CHANNEL_COUNT && (channel + 1) < Config::LCD_ROWS; ++channel) {
+    char row[32];
+    const Runtime::ChannelControl &cfg = Runtime::channels[channel];
+    snprintf(
+      row,
+      sizeof(row),
+      "%s %s O:%u R:%lu",
+      Config::LCD_LABEL_CHANNELS[channel],
+      modeToShortString(cfg.mode),
+      cfg.lastLevel ? 1 : 0,
+      static_cast<unsigned long>(cfg.pulsesRemaining)
+    );
+    writeRow(channel + 1, row);
+  }
+#endif
+}
+
+}  // namespace LcdDisplay
+
 void setup() {
   pinMode(Config::RS485_DE_RE_PIN, OUTPUT);
   rs485SetTransmit(false);
@@ -855,6 +976,11 @@ void setup() {
   Runtime::lastCommandMillis = millis();
   Runtime::lastModbusByteMillis = 0;
   Runtime::lastModbusError = Runtime::ModbusError::None;
+  Runtime::lastLcdRefreshMillis = 0;
+
+  if (Config::ENABLE_DEBUG_LCD) {
+    LcdDisplay::begin();
+  }
 }
 
 void loop() {
@@ -865,4 +991,5 @@ void loop() {
   }
 
   applyOutputs();
+  LcdDisplay::update();
 }
