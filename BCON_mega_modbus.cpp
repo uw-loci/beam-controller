@@ -56,7 +56,6 @@ constexpr size_t MODBUS_RX_BUFFER_SIZE = 256;
 constexpr uint32_t MODBUS_FRAME_GAP_MS = 4;
 
 constexpr bool ENABLE_DEBUG_LCD = (BCON_ENABLE_I2C_LCD != 0);
-constexpr bool ENABLE_LCD_INIT_DEBUG = true;
 constexpr uint8_t LCD_I2C_ADDRESS = 0x27;
 constexpr uint8_t LCD_COLS = 20;
 constexpr uint8_t LCD_ROWS = 4;
@@ -111,6 +110,8 @@ ChannelControl channels[Config::CHANNEL_COUNT];
 
 volatile uint32_t chCountdownMs[Config::CHANNEL_COUNT] = {0};
 volatile bool chEventFlag[Config::CHANNEL_COUNT] = {false};
+volatile uint16_t enableToggleCountdownMs[Config::CHANNEL_COUNT] = {0};
+volatile bool enableToggleEventFlag[Config::CHANNEL_COUNT] = {false};
 volatile uint32_t lcdCountdownMs = 0;
 volatile bool lcdEventFlag = false;
 
@@ -238,11 +239,12 @@ static void setModbusError(Runtime::ModbusError error) {
 static void pulseEnableToggle(uint8_t channelIndex) {
   const uint8_t pin = Config::PULSER_ENABLE_TOGGLE_OUTPUT_PINS[channelIndex];
   const uint8_t activeLevel = Config::ENABLE_TOGGLE_ACTIVE_HIGH ? HIGH : LOW;
-  const uint8_t inactiveLevel = Config::ENABLE_TOGGLE_ACTIVE_HIGH ? LOW : HIGH;
 
   digitalWrite(pin, activeLevel);
-  delay(Config::ENABLE_TOGGLE_PULSE_MS);
-  digitalWrite(pin, inactiveLevel);
+  noInterrupts();
+  Runtime::enableToggleCountdownMs[channelIndex] = Config::ENABLE_TOGGLE_PULSE_MS;
+  Runtime::enableToggleEventFlag[channelIndex] = false;
+  interrupts();
 }
 
 static void rs485SetTransmit(bool enabled) {
@@ -328,10 +330,37 @@ static void channelTimerTick(uint8_t channel) {
 }
 
 static void lcdTimerTick() {
+  for (uint8_t channel = 0; channel < Config::CHANNEL_COUNT; ++channel) {
+    if (Runtime::enableToggleCountdownMs[channel] > 0) {
+      Runtime::enableToggleCountdownMs[channel]--;
+      if (Runtime::enableToggleCountdownMs[channel] == 0) {
+        Runtime::enableToggleEventFlag[channel] = true;
+      }
+    }
+  }
+
   if (Runtime::lcdCountdownMs > 0) {
     Runtime::lcdCountdownMs--;
     if (Runtime::lcdCountdownMs == 0) {
       Runtime::lcdEventFlag = true;
+    }
+  }
+}
+
+static void serviceEnableToggleOutputs() {
+  const uint8_t inactiveLevel = Config::ENABLE_TOGGLE_ACTIVE_HIGH ? LOW : HIGH;
+
+  for (uint8_t channel = 0; channel < Config::CHANNEL_COUNT; ++channel) {
+    bool event = false;
+    noInterrupts();
+    if (Runtime::enableToggleEventFlag[channel]) {
+      Runtime::enableToggleEventFlag[channel] = false;
+      event = true;
+    }
+    interrupts();
+
+    if (event) {
+      digitalWrite(Config::PULSER_ENABLE_TOGGLE_OUTPUT_PINS[channel], inactiveLevel);
     }
   }
 }
@@ -399,6 +428,11 @@ static void setupLcdTimer() {
   TCCR5B |= (1 << WGM52);
   TCCR5B |= (1 << CS51) | (1 << CS50);
   TIMSK5 |= (1 << OCIE5A);
+
+  for (uint8_t channel = 0; channel < Config::CHANNEL_COUNT; ++channel) {
+    Runtime::enableToggleCountdownMs[channel] = 0;
+    Runtime::enableToggleEventFlag[channel] = false;
+  }
 
   Runtime::lcdCountdownMs = 0;
   Runtime::lcdEventFlag = false;
@@ -1009,30 +1043,17 @@ bool lcdFirstUpdateLogged = false;
 char lineCache[Config::LCD_ROWS][Config::LCD_COLS + 1] = {{0}};
 
 static void lcdInitDebugPrint(const char *msg) {
-  if (!Config::ENABLE_LCD_INIT_DEBUG || msg == nullptr) {
-    return;
-  }
-  Serial.println(msg);
+  (void)msg;
 }
 
 static void lcdInitDebugPrintAddress(const char *prefix, uint8_t address) {
-  if (!Config::ENABLE_LCD_INIT_DEBUG || prefix == nullptr) {
-    return;
-  }
-
-  char buf[40];
-  snprintf(buf, sizeof(buf), "%s0x%02X", prefix, address);
-  Serial.println(buf);
+  (void)prefix;
+  (void)address;
 }
 
 static void lcdInitDebugPrintRow(uint8_t row, const char *text) {
-  if (!Config::ENABLE_LCD_INIT_DEBUG || text == nullptr) {
-    return;
-  }
-
-  char buf[48];
-  snprintf(buf, sizeof(buf), "[LCD] row %u <= %s", static_cast<unsigned>(row), text);
-  Serial.println(buf);
+  (void)row;
+  (void)text;
 }
 
 static bool i2cAddressPresent(uint8_t address) {
@@ -1154,10 +1175,6 @@ void update() {
 }  // namespace LcdDisplay
 
 void setup() {
-  if (Config::ENABLE_LCD_INIT_DEBUG && !Config::USE_USB_SERIAL) {
-    Serial.begin(115200);
-  }
-
   if (!Config::USE_USB_SERIAL) {
     pinMode(Config::RS485_DE_RE_PIN, OUTPUT);
     rs485SetTransmit(false);
@@ -1210,6 +1227,7 @@ void setup() {
 }
 
 void loop() {
+  serviceEnableToggleOutputs();
   pollModbus();
 
   if (isAnyOverCurrentAsserted()) {
