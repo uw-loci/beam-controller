@@ -1251,4 +1251,5 @@ void loop() {
 
   applyOutputs();
   LcdDisplay::update();
+  //while(1); //Watch dog timer test.
 }
