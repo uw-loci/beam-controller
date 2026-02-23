@@ -372,15 +372,6 @@ ISR(TIMER4_COMPA_vect) { channelTimerTick(2); }
 ISR(TIMER5_COMPA_vect) { lcdTimerTick(); }
 
 static void setupChannelTimers() {
-  // disable the watchdog temporarily while we configure
-  // the hardware timers.  After setup is complete we re-enable
-  // it so that the system will reset if the main loop hangs.
-  wdt_disable();
-  // set the watchdog timeout to approximately 2 seconds.
-  // this value is arbitrary but must be longer than our
-  // normal loop execution time; it is also reconfigured
-  // elsewhere if a modbus command changes the timeout.
-  wdt_enable(WDTO_2S);
   noInterrupts();
 
   TCCR1A = 0;
@@ -1185,6 +1176,16 @@ void update() {
 }  // namespace LcdDisplay
 
 void setup() {
+  // disable the watchdog temporarily while we configure
+  // the hardware timers.  After setup is complete we re-enable
+  // it so that the system will reset if the main loop hangs.
+  wdt_disable();
+  // set the watchdog timeout to approximately 2 seconds.
+  // this value is arbitrary but must be longer than our
+  // normal loop execution time; it is also reconfigured
+  // elsewhere if a modbus command changes the timeout.
+  wdt_enable(WDTO_2S);
+  
   if (!Config::USE_USB_SERIAL) {
     pinMode(Config::RS485_DE_RE_PIN, OUTPUT);
     rs485SetTransmit(false);
