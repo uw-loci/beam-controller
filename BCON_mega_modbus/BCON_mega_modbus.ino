@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <string.h>
+#include <avr/wdt.h>
 
 #ifndef BCON_MODBUS_USE_USB_SERIAL
 #define BCON_MODBUS_USE_USB_SERIAL 1
@@ -1175,6 +1176,16 @@ void update() {
 }  // namespace LcdDisplay
 
 void setup() {
+  // disable the watchdog temporarily while we configure
+  // the hardware timers.  After setup is complete we re-enable
+  // it so that the system will reset if the main loop hangs.
+  wdt_disable();
+  // set the watchdog timeout to approximately 2 seconds.
+  // this value is arbitrary but must be longer than our
+  // normal loop execution time; it is also reconfigured
+  // elsewhere if a modbus command changes the timeout.
+  wdt_enable(WDTO_2S);
+  
   if (!Config::USE_USB_SERIAL) {
     pinMode(Config::RS485_DE_RE_PIN, OUTPUT);
     rs485SetTransmit(false);
@@ -1227,6 +1238,10 @@ void setup() {
 }
 
 void loop() {
+  // pet the watchdog each iteration; if we ever fail to call
+  // this because the loop is stuck the hardware will automatically
+  // reset the MCU after the configured timeout.
+  wdt_reset();
   serviceEnableToggleOutputs();
   pollModbus();
 
