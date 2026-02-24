@@ -1,0 +1,51 @@
+# BCON Pulse Sequence — example_sequence.csv
+# ============================================================
+# Columns:
+#   step        - integer; rows sharing a step number launch together
+#   ch          - channel number (1, 2, 3) or ALL
+#   mode        - OFF | DC | PULSE | PULSE_TRAIN
+#   duration_ms - pulse width in ms  (PULSE / PULSE_TRAIN only; leave blank for OFF/DC)
+#   count       - pulse count        (PULSE_TRAIN must be >= 2; leave blank for OFF/DC)
+#   dwell_ms    - wait AFTER this step before the next one
+#                 (only the last row per step number is used)
+# ============================================================
+step,ch,mode,duration_ms,count,dwell_ms
+
+# --- Step 1 ---------------------------------------------------
+# CH1: single 100 ms pulse
+# CH2: single 200 ms pulse
+# CH3: goes DC (continuous)
+# After all three are started, wait 5000 ms before step 2
+1,1,PULSE,100,1,0
+1,2,PULSE,200,1,0
+1,3,DC,,,5000
+
+# --- Step 2 ---------------------------------------------------
+# CH1: burst of 10 × 50 ms pulses (PULSE_TRAIN, count >= 2 required)
+# CH2: stays off
+# CH3: stays DC (no change sent — not included in this step)
+# Dwell 1000 ms to let the train finish before step 3
+2,1,PULSE_TRAIN,50,10,0
+2,2,OFF,,,1000
+
+# --- Step 3 ---------------------------------------------------
+# CH1 and CH2: simultaneous 75 ms single pulses
+# Wait 300 ms
+3,1,PULSE,75,1,0
+3,2,PULSE,75,1,300
+
+# --- Step 4 ---------------------------------------------------
+# All three channels off at once; wait 200 ms
+4,ALL,OFF,,,200
+
+# --- Step 5 ---------------------------------------------------
+# CH1: rapid 25 ms × 20 pulse train
+# CH2 and CH3: DC while CH1 pulses
+# Dwell 2000 ms to allow the train to complete
+5,1,PULSE_TRAIN,25,20,0
+5,2,DC,,,0
+5,3,DC,,,2000
+
+# --- Step 6 ---------------------------------------------------
+# Final safe state: all channels off
+6,ALL,OFF,,,0
