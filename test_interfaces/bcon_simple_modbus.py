@@ -4,7 +4,12 @@ from dataclasses import dataclass
 import inspect
 from typing import Dict, Any
 
+import logging
+import time
 from pymodbus.client import ModbusSerialClient
+
+# suppress chatty pymodbus internals
+logging.getLogger("pymodbus").setLevel(logging.ERROR)
 
 
 REG_WATCHDOG_MS = 0
@@ -58,11 +63,25 @@ class BconModbus:
                 timeout=timeout,
             )
 
-    def connect(self) -> bool:
-        return bool(self.client.connect())
+    def connect(self, settle_s: float = 2.5) -> bool:
+        """Open the port and wait for the Mega to finish its boot sequence.
+        
+        Opening the serial port asserts DTR which resets the Arduino.  We must
+        wait for the firmware to complete setup() (LCD init + WDT enable) before
+        sending any Modbus frames, otherwise pymodbus times out immediately.
+        """
+        ok = bool(self.client.connect())
+        if ok and settle_s > 0:
+            time.sleep(settle_s)
+        return ok
 
     def close(self) -> None:
-        self.client.close()
+        # close underlying serial connection and forget the client object
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        self.client = None
 
     @staticmethod
     def _is_ok(response: Any) -> bool:
@@ -118,6 +137,10 @@ class BconModbus:
         self._write_reg(REG_CH_MODE[channel], 2)
 
     def read_status(self) -> BconStatus:
+        # One sys read + three individual channel reads (9 regs each).
+        # NOTE: each channel block occupies a stride of 10 but only offsets 0-8
+        # are implemented; reading 29 contiguous registers would cross the gap
+        # at offsets 9/19 which the firmware rejects with exception 0x02.
         sys_regs = self._read_regs(REG_SYS_STATE_BASE, 6)
 
         channels: Dict[int, Dict[str, int]] = {}
@@ -125,15 +148,15 @@ class BconModbus:
             base = REG_CH_STATUS_BASE + (ch - 1) * REG_CH_STATUS_STRIDE
             regs = self._read_regs(base, 9)
             channels[ch] = {
-                "mode": regs[0],
-                "pulse_ms": regs[1],
-                "count": regs[2],
-                "remaining": regs[3],
-                "enable": regs[4],
-                "power": regs[5],
+                "mode":        regs[0],
+                "pulse_ms":    regs[1],
+                "count":       regs[2],
+                "remaining":   regs[3],
+                "enable":      regs[4],
+                "power":       regs[5],
                 "overcurrent": regs[6],
-                "gated": regs[7],
-                "gate_out": regs[8],
+                "gated":       regs[7],
+                "gate_out":    regs[8],
             }
 
         return BconStatus(

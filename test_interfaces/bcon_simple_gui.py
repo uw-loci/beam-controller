@@ -10,11 +10,13 @@ class App:
         self.root.title("BCON Simple Modbus GUI")
         self.driver: BconModbus | None = None
 
-        self.port_var = tk.StringVar(value="COM3")
+        self.port_var = tk.StringVar(value="/dev/ttyACM0")
         self.channel_var = tk.IntVar(value=1)
         self.duration_var = tk.StringVar(value="100")
         self.watchdog_var = tk.StringVar(value="1000")
         self.status_var = tk.StringVar(value="Disconnected")
+        self._error_count = 0          # consecutive comm errors before auto-disconnect
+        self._MAX_ERRORS   = 4         # tolerate this many failures before giving up
 
         self._build_ui()
         self._tick()
@@ -47,17 +49,27 @@ class App:
 
     def connect(self) -> None:
         self.disconnect()
-        self.driver = BconModbus(port=self.port_var.get())
-        if not self.driver.connect():
+        self.status_var.set("Connecting… (waiting for firmware boot)")
+        self.root.update_idletasks()
+        try:
+            self.driver = BconModbus(port=self.port_var.get())
+            ok = self.driver.connect(settle_s=2.5)   # wait for Mega DTR-reset to finish
+        except Exception as exc:
+            ok = False
+            self.status_var.set(f"Connect error: {exc}")
+
+        if not ok:
             self.status_var.set("Connect failed")
             self.driver = None
             return
+        self._error_count = 0
         self.status_var.set("Connected")
 
     def disconnect(self) -> None:
         if self.driver is not None:
             self.driver.close()
             self.driver = None
+        self._error_count = 0
         self.status_var.set("Disconnected")
 
     def set_watchdog(self) -> None:
@@ -102,6 +114,7 @@ class App:
                 self.driver.kick_watchdog()
                 status = self.driver.read_status()
                 ch = status.channels[int(self.channel_var.get())]
+                self._error_count = 0
                 self.status_var.set(
                     f"SYS={status.sys_state} REASON={status.sys_reason} "
                     f"FLT={status.fault_latched} INT={status.interlock_ok} WD={status.watchdog_ok} "
@@ -109,7 +122,17 @@ class App:
                     f"remain={ch['remaining']} en={ch['enable']} pwr={ch['power']} oc={ch['overcurrent']}"
                 )
             except Exception as exc:
-                self.status_var.set(f"Comm error: {exc}")
+                self._error_count += 1
+                remaining = self._MAX_ERRORS - self._error_count
+                if remaining > 0:
+                    # transient error – keep trying, show a warning
+                    self.status_var.set(
+                        f"Comm error ({self._error_count}/{self._MAX_ERRORS}): {exc} – retrying…"
+                    )
+                else:
+                    # too many consecutive failures – give up
+                    self.status_var.set(f"Disconnected after {self._MAX_ERRORS} errors: {exc}")
+                    self.disconnect()
 
         self.root.after(300, self._tick)
 
