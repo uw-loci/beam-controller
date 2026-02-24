@@ -23,6 +23,7 @@ import json
 import csv
 import time
 import inspect
+import logging
 import queue
 import threading
 from datetime import datetime
@@ -45,6 +46,9 @@ except Exception as e:
     print("pyserial import error:", e)
     print("Install with: pip install pyserial")
     raise
+
+# suppress chatty pymodbus retry/timeout messages
+logging.getLogger("pymodbus").setLevel(logging.ERROR)
 
 # ----------------------------- Modbus / Register map -----------------------------
 TOTAL_REGS = 160
@@ -98,8 +102,10 @@ class ModbusManager(threading.Thread):
         self.cmd_queue = queue.Queue()
         self.connected = False
         self.last_regs = [0] * TOTAL_REGS
+        self._poll_errors = 0          # consecutive poll failures
+        self._MAX_POLL_ERRORS = 4      # tolerate this many before auto-disconnect
 
-    def connect(self, port, baud, unit):
+    def connect(self, port, baud, unit, settle_s: float = 2.5):
         self.port = port
         self.baud = baud
         self.unit = unit
@@ -120,12 +126,18 @@ class ModbusManager(threading.Thread):
             self.ui_queue.put(("error", f"Connect failed: {e}"))
             self.ui_queue.put(("connected", False))
             return False
+        # Opening the serial port asserts DTR which resets the Arduino Mega.
+        # Wait for the firmware to complete setup() before sending Modbus frames.
+        if ok and settle_s > 0:
+            time.sleep(settle_s)
         self.connected = ok
+        self._poll_errors = 0
         self.ui_queue.put(("connected", ok))
         return ok
 
     def disconnect(self):
         self.connected = False
+        self._poll_errors = 0
         if self.client:
             try:
                 self.client.close()
@@ -198,32 +210,51 @@ class ModbusManager(threading.Thread):
                     ok = True
                     ok &= read_block(0, 34)      # control regs (includes CH3 enable-toggle register)
                     ok &= read_block(100, 6)     # system status regs
-                    ok &= read_block(110, 29)    # channel status regs 110..138
+                    # Each channel status block is 10 registers wide but only
+                    # offsets 0-8 are implemented; reading 29 contiguous regs
+                    # would hit the unimplemented offsets 9/19 (addresses 119/129)
+                    # which the firmware rejects with Modbus exception 0x02.
+                    ok &= read_block(110, 9)     # CH1 status regs 110-118
+                    ok &= read_block(120, 9)     # CH2 status regs 120-128
+                    ok &= read_block(130, 9)     # CH3 status regs 130-138
 
                     if not ok:
-                        # generic failure, but not an exception; log if different
-                        err = "Modbus read failed"
+                        self._poll_errors += 1
+                        err = f"Modbus read failed ({self._poll_errors}/{self._MAX_POLL_ERRORS})"
                         if err != last_error_msg:
                             self.ui_queue.put(("error", err))
                             last_error_msg = err
-                    elif regs != self.last_regs:
-                        self.last_regs = regs.copy()
-                        self.ui_queue.put(("regs", regs))
+                        if self._poll_errors >= self._MAX_POLL_ERRORS:
+                            self.connected = False
+                            if self.client:
+                                try:
+                                    self.client.close()
+                                except Exception:
+                                    pass
+                                self.client = None
+                            self.ui_queue.put(("connected", False))
+                    else:
+                        self._poll_errors = 0
+                        if regs != self.last_regs:
+                            self.last_regs = regs.copy()
+                            self.ui_queue.put(("regs", regs))
                         last_error_msg = None
                 except Exception as e:
-                    err = f"Poll error: {e}"
+                    self._poll_errors += 1
+                    err = f"Poll error ({self._poll_errors}/{self._MAX_POLL_ERRORS}): {e}"
                     if err != last_error_msg:
                         self.ui_queue.put(("error", err))
                         last_error_msg = err
-                    # mark disconnected and tear down client to avoid further attempts
-                    self.connected = False
-                    if self.client:
-                        try:
-                            self.client.close()
-                        except Exception:
-                            pass
-                        self.client = None
-                    self.ui_queue.put(("connected", False))
+                    if self._poll_errors >= self._MAX_POLL_ERRORS:
+                        # too many consecutive failures – tear down
+                        self.connected = False
+                        if self.client:
+                            try:
+                                self.client.close()
+                            except Exception:
+                                pass
+                            self.client = None
+                        self.ui_queue.put(("connected", False))
             time.sleep(POLL_INTERVAL)
 
 # ----------------------------- Utility helpers -----------------------------
@@ -466,10 +497,19 @@ class PulserApp(ctk.CTk):
                 return
             baud = int(self.baud_entry.get())
             unit = int(self.unit_entry.get())
-            ok = self.modbus.connect(port, baud, unit)
+            # Warn user: opening the port resets the Mega via DTR; we block here
+            # for ~2.5 s while firmware completes setup().
+            self.conn_label.configure(text="Connecting… (waiting for boot)", text_color="orange")
+            self.connect_btn.configure(state="disabled")
+            self.update_idletasks()
+            try:
+                ok = self.modbus.connect(port, baud, unit)
+            finally:
+                self.connect_btn.configure(state="normal")
             if ok:
                 self.conn_label.configure(text=f"Connected ({port})", text_color="green")
             else:
+                self.conn_label.configure(text="Connect failed", text_color="red")
                 messagebox.showerror("Connect", f"Failed to open port {port}")
         else:
             self.modbus.disconnect()
