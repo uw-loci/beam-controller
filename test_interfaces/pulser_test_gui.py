@@ -163,6 +163,7 @@ class ModbusManager(threading.Thread):
         return read_fn(start, count)
 
     def run(self):
+        last_error_msg = None
         while not self._stop_event.is_set():
             # process queued commands first
             try:
@@ -200,14 +201,28 @@ class ModbusManager(threading.Thread):
                     ok &= read_block(110, 29)    # channel status regs 110..138
 
                     if not ok:
-                        self.ui_queue.put(("error", "Modbus read failed"))
+                        # generic failure, but not an exception; log if different
+                        err = "Modbus read failed"
+                        if err != last_error_msg:
+                            self.ui_queue.put(("error", err))
+                            last_error_msg = err
                     elif regs != self.last_regs:
                         self.last_regs = regs.copy()
                         self.ui_queue.put(("regs", regs))
+                        last_error_msg = None
                 except Exception as e:
-                    self.ui_queue.put(("error", f"Poll error: {e}"))
-                    # mark disconnected
+                    err = f"Poll error: {e}"
+                    if err != last_error_msg:
+                        self.ui_queue.put(("error", err))
+                        last_error_msg = err
+                    # mark disconnected and tear down client to avoid further attempts
                     self.connected = False
+                    if self.client:
+                        try:
+                            self.client.close()
+                        except Exception:
+                            pass
+                        self.client = None
                     self.ui_queue.put(("connected", False))
             time.sleep(POLL_INTERVAL)
 
@@ -380,6 +395,19 @@ class PulserApp(ctk.CTk):
         self.remote_arm_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(safety_frame, text="REMOTE_ARM", variable=self.remote_arm_var, command=self._toggle_remote_arm).grid(row=1, column=1, padx=12)
 
+        # System settings (watchdog / telemetry)
+        sys_frame = ctk.CTkFrame(left)
+        sys_frame.pack(fill="x", pady=8, padx=6)
+        ctk.CTkLabel(sys_frame, text="System Settings", font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, columnspan=4, sticky="w", pady=(6,8))
+        ctk.CTkLabel(sys_frame, text="Watchdog (ms):").grid(row=1, column=0, sticky="w")
+        self.watchdog_entry = ctk.CTkEntry(sys_frame, width=80)
+        self.watchdog_entry.grid(row=1, column=1, padx=4, sticky="w")
+        ctk.CTkButton(sys_frame, text="Set", width=60, command=self._set_watchdog).grid(row=1, column=2, padx=4)
+        ctk.CTkLabel(sys_frame, text="Telemetry (ms):").grid(row=2, column=0, sticky="w", pady=(4,0))
+        self.telemetry_entry = ctk.CTkEntry(sys_frame, width=80)
+        self.telemetry_entry.grid(row=2, column=1, padx=4, sticky="w", pady=(4,0))
+        ctk.CTkButton(sys_frame, text="Set", width=60, command=self._set_telemetry).grid(row=2, column=2, padx=4, pady=(4,0))
+
         # Arm Beam control (requires explicit confirmation)
         self.arm_btn = ctk.CTkButton(safety_frame, text="Arm Beam", fg_color="#2ecc71", command=self._arm_beam)
         self.arm_btn.grid(row=1, column=2, padx=8, sticky='e')
@@ -551,6 +579,30 @@ class PulserApp(ctk.CTk):
             self._log_event("Beam disarmed via GUI")
             return
 
+    def _set_watchdog(self):
+        val = self.watchdog_entry.get().strip()
+        if not val:
+            return
+        try:
+            ms = int(val)
+        except Exception:
+            messagebox.showerror("Invalid", "Watchdog value must be integer")
+            return
+        self.modbus.enqueue_write(REG_WATCHDOG_MS, ms)
+        self._log_event(f"Set watchdog timeout to {ms} ms")
+
+    def _set_telemetry(self):
+        val = self.telemetry_entry.get().strip()
+        if not val:
+            return
+        try:
+            ms = int(val)
+        except Exception:
+            messagebox.showerror("Invalid", "Telemetry value must be integer")
+            return
+        self.modbus.enqueue_write(REG_TELEMETRY_MS, ms)
+        self._log_event(f"Set telemetry period to {ms} ms")
+
         # confirm explicit action: require typing 'ARM'
         answer = simple_input_dialog(self, "Confirm Arm", "Type ARM to confirm:")
         if not answer or answer.strip().upper() != 'ARM':
@@ -720,6 +772,10 @@ class PulserApp(ctk.CTk):
             sys_state = regs[REG_SYS_STATE]
             self.safety_label.configure(text=f"Interlock: {'ok' if interlock_ok else 'locked'} | Watchdog: {'ok' if watchdog_ok else 'expired'} | State: {sys_state}")
             self.remote_arm_var.set(False)
+
+            # update watchdog/telemetry entry fields with current values
+            self.watchdog_entry.delete(0, 'end'); self.watchdog_entry.insert(0, str(regs[REG_WATCHDOG_MS]))
+            self.telemetry_entry.delete(0, 'end'); self.telemetry_entry.insert(0, str(regs[REG_TELEMETRY_MS]))
 
             if regs[REG_FAULT_LATCHED]:
                 self.arm_status_lbl.configure(text="FAULT LATCHED", text_color="#e74c3c")
