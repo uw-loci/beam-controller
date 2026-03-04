@@ -70,7 +70,7 @@ namespace Config {
 
   // Grace window after boot before the SW watchdog is enforced; prevents a
   // cold-start disconnect before the host has had time to connect.
-  constexpr uint32_t WATCHDOG_BOOT_GRACE_MS = 4000;
+  constexpr uint32_t WATCHDOG_BOOT_GRACE_MS = 8000;
 
   constexpr uint32_t DEFAULT_TELEMETRY_MS = 1500;
 
@@ -110,7 +110,7 @@ namespace Config {
   constexpr uint8_t  LCD_I2C_ADDRESS_FALLBACK = 0x3F; // alt PCF8574A backpack
   constexpr uint8_t  LCD_COLS                 = 20;
   constexpr uint8_t  LCD_ROWS                 = 4;
-  constexpr uint32_t LCD_REFRESH_MS           = 250;
+  constexpr uint32_t LCD_REFRESH_MS           = 1000;
 
   constexpr const char *LCD_LABEL_WATCHDOG              = "WDG";
   constexpr const char *LCD_LABEL_INTERLOCK             = "INT";
@@ -667,11 +667,19 @@ static bool readHoldingRegister(uint16_t reg, uint16_t &out) {
       case 6: out = activeLowRead(Config::OVERCURRENT_STATUS_PINS[ch]) ? 1 : 0;    return true;
       case 7: out = activeLowRead(Config::GATED_STATUS_PINS[ch])       ? 1 : 0;    return true;
       case 8: out = c.lastLevel                                         ? 1 : 0;    return true;
-      default: return false;
+      default: out = 0;                                                             return true;
     }
   }
 
-  return false;
+  // Any register address not covered above (gap addresses 3-9, 14-19, 24-29,
+  // or anything above the defined status blocks) returns 0 instead of causing
+  // the firmware to abort the entire batch read with an exception.  A single
+  // exception aborts ALL values in a multi-register read, which causes the
+  // Python driver to treat the whole poll cycle as a failure and eventually
+  // auto-disconnect.  Returning 0 for unused addresses is safe and keeps batch
+  // reads from wider address ranges working correctly.
+  out = 0;
+  return true;
 }
 
 static bool writeHoldingRegister(uint16_t reg, uint16_t value, uint8_t &exOut) {
@@ -973,7 +981,21 @@ void begin() {
 #if BCON_ENABLE_I2C_LCD
   if (!Config::ENABLE_DEBUG_LCD) return;
 
+  // Manually recover the I2C bus in case a previous crash left SDA held low.
+  // Bit-bang 9 SCL clocks with SDA released so the slave releases the bus.
+  pinMode(20, INPUT_PULLUP);   // SDA
+  pinMode(21, OUTPUT);         // SCL
+  for (uint8_t i = 0; i < 9; ++i) {
+    digitalWrite(21, LOW);  delayMicroseconds(5);
+    digitalWrite(21, HIGH); delayMicroseconds(5);
+  }
+  pinMode(21, INPUT_PULLUP);   // release SCL back to open-drain before Wire takes over
+  delayMicroseconds(10);
+
   Wire.begin();
+#if defined(WIRE_HAS_TIMEOUT) || !defined(__AVR__)
+  Wire.setWireTimeout(3000, true);  // 3 ms timeout; auto-reset bus on hang
+#endif
   // Allow the I2C backpack power rail, oscillator, and HD44780 controller
   // to complete their power-on reset before we send any commands.
   // HD44780 datasheet requires >40 ms after VCC > 2.7 V.
@@ -1012,11 +1034,69 @@ void begin() {
 #endif
 }
 
+
+
+
 void update() {
 #if BCON_ENABLE_I2C_LCD
   if (!Config::ENABLE_DEBUG_LCD || !lcdInitialized) return;
   if (!consumeLcdTimerEvent()) return;
 
+  // When Modbus is active, do ABSOLUTELY NO I2C.
+  // Even a single I2C write to the PCF8574 LCD backpack blocks loop() long
+  // enough to overflow the UART FIFO and corrupt Modbus frames.  The
+  // dashboard shows all status info; the LCD just keeps whatever was last
+  // displayed before the host connected.
+  //
+  // CRITICAL: We also DISABLE the TWI hardware peripheral while Modbus is
+  // active.  The enabled TWI interrupt can interpret electrical noise on the
+  // I2C bus (caused by USB serial traffic) as valid I2C events, generating
+  // spurious writes that corrupt the PCF8574 output register and kill the
+  // backlight.  Every ~2 s we briefly re-enable TWI to send a single
+  // backlight-reassert byte (~180 μs, safe for the 64-byte UART FIFO).
+  //
+  // Detect Modbus activity two ways:
+  //   1. Any valid Modbus frame received in the last 5 seconds
+  //   2. Watchdog healthy after boot grace (steady-state connection)
+  const uint32_t now = millis();
+  const bool hostPolling = (now - Runtime::lastCommandMillis) < 5000 &&
+                           Runtime::lastCommandMillis > 0;
+  const bool modbusActive = hostPolling ||
+                            (isWatchdogHealthy() && now > Runtime::watchdogGraceDeadlineMs);
+
+  static bool twiDisabled = false;
+  static uint32_t lastBacklightMs = 0;
+
+  if (modbusActive) {
+    if (!twiDisabled) {
+      // Shut down the TWI peripheral entirely so noise can't trigger events
+      TWCR = 0;           // disable TWI control register (clears TWIE, TWEN)
+      twiDisabled = true;
+      lastBacklightMs = now;
+    }
+
+    // Every 2 s, briefly re-enable TWI, reassert the backlight, and shut
+    // TWI down again.  A single expanderWrite is ~180 μs — safe.
+    if (now - lastBacklightMs >= 2000) {
+      Wire.begin();                    // re-enable TWI
+      lcd->backlight();                // single I2C write: reassert backlight
+      TWCR = 0;                        // disable TWI again immediately
+      lastBacklightMs = now;
+    }
+
+    armLcdTimer(500);    // wake up frequently to check backlight timer
+    return;
+  }
+
+  // ---- Modbus idle: re-enable TWI if it was disabled ----
+  if (twiDisabled) {
+    Wire.begin();
+#if defined(WIRE_HAS_TIMEOUT) || !defined(__AVR__)
+    Wire.setWireTimeout(3000, true);
+#endif
+    lcd->backlight();    // ensure backlight is on after TWI re-enable
+    twiDisabled = false;
+  }
   armLcdTimer(Config::LCD_REFRESH_MS);
 
   // Row 0: system health
@@ -1059,6 +1139,8 @@ void setup() {
   }
 
   Config::RS485_SERIAL.begin(Config::RS485_BAUD);
+  // Drain any garbage that accumulated in the UART buffer during reset
+  while (Config::RS485_SERIAL.available()) Config::RS485_SERIAL.read();
 
   pinMode(Config::KB_INTERLOCK_PIN,
           Config::INTERLOCK_USE_PULLUP ? INPUT_PULLUP : INPUT);
