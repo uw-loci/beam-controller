@@ -1064,14 +1064,18 @@ void update() {
   // "Frame in flight" guard: a byte arrived very recently (frame being
   // received or just processed).  50 ms is very conservative — a full
   // request/response cycle takes < 2 ms — but gives margin for jitter.
+  // Gate on framePending ALONE: hostPolling only becomes true after the
+  // FIRST valid frame completes, so checking (hostPolling && framePending)
+  // would miss the very first frame after boot or after >5 s idle, allowing
+  // an I2C write to race with an incoming Modbus byte.
   const bool framePending = (Runtime::modbusRxIndex > 0) ||
       (Runtime::lastModbusByteMillis > 0 &&
        (now - Runtime::lastModbusByteMillis) < 50);
 
   static bool twiDisabled = false;
 
-  if (hostPolling && framePending) {
-    // Too close to a Modbus frame — defer until we are in the quiet gap.
+  if (framePending) {
+    // Any recent serial activity — defer until we are in the quiet gap.
     if (!twiDisabled) { TWCR = 0; twiDisabled = true; }
     armLcdTimer(50);   // retry in 50 ms
     return;

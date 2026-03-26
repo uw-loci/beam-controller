@@ -204,15 +204,18 @@ Expected priority order in `evaluateTopLevelState()`:
 
 **CRITICAL: This is a race-condition sensitive area - verify thoroughly**
 
-```cpp
-// In LcdDisplay::update() when modbusActive=true, TWI should be disabled
-```
+Current strategy: LCD refreshes in the inter-poll quiet window (~250 ms gap between
+dashboard polls). A refresh is skipped — and deferred 50 ms — if any Modbus byte
+arrived in the last 50 ms (`framePending`). TWI is disabled (`TWCR = 0`) between
+refreshes to prevent electrical noise from corrupting the PCF8574 output register.
+I2C clock runs at 400 kHz, keeping the full 4-row refresh to ~20 ms.
 
 | Test Case | Verify |
 |-----------|--------|
-| LC-001 | LCD does **not update** while Modbus polling active (5-second window) |
-| LC-002 | TWI peripheral disabled via `TWCR = 0` when host polling detected |
-| LC-003 | Backlight reasserted every ~2s even during modbus activity |
+| LC-001 | LCD **does update** ~once per second even while host is connected (quiet-window refresh) |
+| LC-002 | TWI peripheral disabled (`TWCR = 0`) between refreshes and re-enabled only for the ~20 ms render window |
+| LC-003 | No LCD update occurs within 50 ms of the last Modbus byte (defer path fires, retries in 50 ms) |
+| LC-004 | First frame after boot (before any valid command): `framePending` alone blocks I2C — no race with first incoming frame |
 
 ### 6.2 LCD Content Verification
 
@@ -334,10 +337,10 @@ LCD I2C:             SDA(20), SCL(21) - used in bit-bang recovery only
 
 ## Notes on Firmware Design Issues Found During Review
 
-1. **LCD/TWI Race Condition**: The firmware intentionally disables TWI during Modbus activity to prevent UART FIFO overflow. This is correct but creates a UX issue where LCD freezes when host connected. Consider if this trade-off is acceptable.
+1. **LCD/TWI Quiet-Window Refresh**: TWI is disabled between refreshes to block noise from USB serial traffic. The LCD updates ~once per second in the inter-poll gap, so the display stays live while the host is connected. Any refresh attempt within 50 ms of a Modbus byte is deferred; the gate keys off `framePending` (recent serial activity) alone — not on whether a full valid frame has completed — to close the first-frame race at boot or after >5 s idle.
 
 2. **Silent CRC Errors**: Invalid CRC frames are silently discarded without logging or status update. May make debugging communication issues harder.
 
 3. **Watchdog Grace Period**: 8-second grace window may be too long for some applications - consider making it configurable.
 
-4. **Missing Function Codes**: Only FC 0x03, 0x06, and 0x10 supported. FC 0x02 (Read Coils) not implemented but should return exception rather than silently ignoring.
+4. **Unsupported Function Codes**: Only FC 0x03, 0x06, and 0x10 are implemented. Any other function code (e.g., FC 0x01, 0x02) returns Modbus exception 0x01 (Illegal Function) — not silently ignored.
