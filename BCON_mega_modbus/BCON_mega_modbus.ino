@@ -1042,62 +1042,48 @@ void update() {
   if (!Config::ENABLE_DEBUG_LCD || !lcdInitialized) return;
   if (!consumeLcdTimerEvent()) return;
 
-  // When Modbus is active, do ABSOLUTELY NO I2C.
-  // Even a single I2C write to the PCF8574 LCD backpack blocks loop() long
-  // enough to overflow the UART FIFO and corrupt Modbus frames.  The
-  // dashboard shows all status info; the LCD just keeps whatever was last
-  // displayed before the host connected.
+  // I2C / TWI safety strategy
+  // ─────────────────────────
+  // Problem 1 — timing: a full 4-row LCD write at 100 kHz takes ~80 ms,
+  //   easily overflowing the 64-byte UART ring-buffer during an active poll.
+  //   Fix: run I2C at 400 kHz (reduces full refresh to ~20 ms) and only
+  //   update when no Modbus byte has arrived in the last 50 ms (i.e., we are
+  //   solidly inside the ~250 ms inter-poll gap).
   //
-  // CRITICAL: We also DISABLE the TWI hardware peripheral while Modbus is
-  // active.  The enabled TWI interrupt can interpret electrical noise on the
-  // I2C bus (caused by USB serial traffic) as valid I2C events, generating
-  // spurious writes that corrupt the PCF8574 output register and kill the
-  // backlight.  Every ~2 s we briefly re-enable TWI to send a single
-  // backlight-reassert byte (~180 μs, safe for the 64-byte UART FIFO).
-  //
-  // Detect Modbus activity two ways:
-  //   1. Any valid Modbus frame received in the last 5 seconds
-  //   2. Watchdog healthy after boot grace (steady-state connection)
+  // Problem 2 — electrical noise: USB serial traffic induces glitches on the
+  //   I2C lines that trigger spurious TWI interrupts, corrupting the PCF8574
+  //   output register and killing the backlight.
+  //   Fix: keep TWCR = 0 (TWI hardware off) between updates; re-enable only
+  //   for the brief render window (~20 ms) then disable immediately after.
   const uint32_t now = millis();
-  const bool hostPolling = (now - Runtime::lastCommandMillis) < 5000 &&
-                           Runtime::lastCommandMillis > 0;
-  const bool modbusActive = hostPolling ||
-                            (isWatchdogHealthy() && now > Runtime::watchdogGraceDeadlineMs);
+
+  // "Host connected" flag: any valid Modbus frame in last 5 s.
+  const bool hostPolling = (Runtime::lastCommandMillis > 0) &&
+                           (now - Runtime::lastCommandMillis < 5000);
+
+  // "Frame in flight" guard: a byte arrived very recently (frame being
+  // received or just processed).  50 ms is very conservative — a full
+  // request/response cycle takes < 2 ms — but gives margin for jitter.
+  const bool framePending = (Runtime::modbusRxIndex > 0) ||
+      (Runtime::lastModbusByteMillis > 0 &&
+       (now - Runtime::lastModbusByteMillis) < 50);
 
   static bool twiDisabled = false;
-  static uint32_t lastBacklightMs = 0;
 
-  if (modbusActive) {
-    if (!twiDisabled) {
-      // Shut down the TWI peripheral entirely so noise can't trigger events
-      TWCR = 0;           // disable TWI control register (clears TWIE, TWEN)
-      twiDisabled = true;
-      lastBacklightMs = now;
-    }
-
-    // Every 2 s, briefly re-enable TWI, reassert the backlight, and shut
-    // TWI down again.  A single expanderWrite is ~180 μs — safe.
-    if (now - lastBacklightMs >= 2000) {
-      Wire.begin();                    // re-enable TWI
-      lcd->backlight();                // single I2C write: reassert backlight
-      TWCR = 0;                        // disable TWI again immediately
-      lastBacklightMs = now;
-    }
-
-    armLcdTimer(500);    // wake up frequently to check backlight timer
+  if (hostPolling && framePending) {
+    // Too close to a Modbus frame — defer until we are in the quiet gap.
+    if (!twiDisabled) { TWCR = 0; twiDisabled = true; }
+    armLcdTimer(50);   // retry in 50 ms
     return;
   }
 
-  // ---- Modbus idle: re-enable TWI if it was disabled ----
-  if (twiDisabled) {
-    Wire.begin();
+  // Safe window: re-enable TWI at 400 kHz, refresh all rows, then disable.
+  Wire.begin();
+  Wire.setClock(400000);   // 400 kHz ≈ 20 ms for a full 4-row refresh
 #if defined(WIRE_HAS_TIMEOUT) || !defined(__AVR__)
-    Wire.setWireTimeout(3000, true);
+  Wire.setWireTimeout(3000, true);
 #endif
-    lcd->backlight();    // ensure backlight is on after TWI re-enable
-    twiDisabled = false;
-  }
-  armLcdTimer(Config::LCD_REFRESH_MS);
+  lcd->backlight();
 
   // Row 0: system health
   char row0[Config::LCD_COLS + 1];
@@ -1118,6 +1104,14 @@ void update() {
       static_cast<unsigned long>(c.pulsesRemaining));
     writeRow(ch + 1, row);
   }
+
+  // Disable TWI immediately after render to block noise during the next
+  // inter-render idle period.  Always disabled regardless of host state —
+  // re-enabled at the start of every update tick.
+  TWCR = 0;
+  twiDisabled = true;
+
+  armLcdTimer(Config::LCD_REFRESH_MS);
 #endif
 }
 
@@ -1167,8 +1161,9 @@ void setup() {
   }
 
   // Initialize SW watchdog timestamps
-  Runtime::lastCommandMillis       = millis();
-  Runtime::watchdogGraceDeadlineMs = Runtime::lastCommandMillis + Config::WATCHDOG_BOOT_GRACE_MS;
+  // Start with no host command yet (prevents boot-state from being treated as active host polling).
+  Runtime::lastCommandMillis       = 0;
+  Runtime::watchdogGraceDeadlineMs = millis() + Config::WATCHDOG_BOOT_GRACE_MS;
   Runtime::lastModbusByteMillis    = 0;
   Runtime::lastModbusError         = Runtime::ModbusError::None;
 
