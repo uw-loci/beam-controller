@@ -104,6 +104,8 @@ class ModbusManager(threading.Thread):
         self.last_regs = [0] * TOTAL_REGS
         self._poll_errors = 0          # consecutive poll failures
         self._MAX_POLL_ERRORS = 4      # tolerate this many before auto-disconnect
+        self._heartbeat_counter = 0    # counts poll cycles; triggers periodic NOP write
+        self._HEARTBEAT_EVERY = 3      # write NOP every N poll cycles (~0.9 s at 0.3 s interval)
 
     def connect(self, port, baud, unit, settle_s: float = 2.5):
         self.port = port
@@ -218,7 +220,21 @@ class ModbusManager(threading.Thread):
                     ok &= read_block(120, 9)     # CH2 status regs 120-128
                     ok &= read_block(130, 9)     # CH3 status regs 130-138
 
+                    if ok:
+                        # Periodic explicit NOP heartbeat write (COMMAND=0) so the
+                        # firmware SW watchdog is fed by a write frame even when the
+                        # operator makes no control changes.  Defense-in-depth on top
+                        # of the firmware feeding on SYS_STATE reads.
+                        self._heartbeat_counter += 1
+                        if self._heartbeat_counter >= self._HEARTBEAT_EVERY:
+                            self._heartbeat_counter = 0
+                            try:
+                                self._write_register_compat(REG_COMMAND, 0)  # NOP
+                            except Exception:
+                                pass  # non-fatal; read-based feed is still active
+
                     if not ok:
+                        self._heartbeat_counter = 0
                         self._poll_errors += 1
                         err = f"Modbus read failed ({self._poll_errors}/{self._MAX_POLL_ERRORS})"
                         if err != last_error_msg:
