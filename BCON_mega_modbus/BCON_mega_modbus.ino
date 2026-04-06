@@ -12,7 +12,7 @@
 //  System control:
 //    0  WATCHDOG_MS      SW watchdog timeout (50-60000 ms, default 1500)
 //    1  TELEMETRY_MS     Informational host poll interval (not enforced)
-//    2  COMMAND          0=NOP, 1=AllOff, 2/3=ClearFault
+//    2  COMMAND          0=NOP, 1=AllOff, 2/3=ClearFault, 4=ApplyStagedModes
 //
 //  Channel control  (base = ch*10, ch=1..3):
 //    base+0  MODE           0=Off 1=DC 2=Pulse 3=PulseTrain
@@ -41,7 +41,9 @@
 // =============================================================================
 
 #include <Arduino.h>
+#include <avr/interrupt.h>
 #include <avr/wdt.h>
+#include <util/atomic.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <ModbusRTU.h>
@@ -104,6 +106,9 @@ namespace Cfg {
     constexpr uint8_t  SLAVE_ID               = 1;
     constexpr uint32_t BAUD                   = 115200;
 
+    constexpr uint16_t PULSE_TIMER_TICK_US    = 100;
+    constexpr uint16_t PULSE_TIMER_OCR        = (uint16_t)((F_CPU / 8UL / (1000000UL / PULSE_TIMER_TICK_US)) - 1UL);
+
     constexpr uint32_t WD_DEFAULT_MS          = 1500;
     constexpr uint32_t WD_MIN_MS              = 50;
     constexpr uint32_t WD_MAX_MS              = 60000;
@@ -164,6 +169,9 @@ static uint32_t g_bootMs       = 0;
 static uint16_t g_lastError    = 0;
 static uint32_t g_telemMs      = Cfg::WD_DEFAULT_MS;
 static uint32_t g_lastSerialByteMs  = 0;
+static volatile bool    g_pulseOutputsEnabled = false;
+static volatile uint8_t g_modeSyncPendingMask = 0;
+static volatile uint8_t g_applyEventPendingMask = 0;
 
 // LCD row caches
 static char g_lcdBuf [Cfg::LCD_ROWS][Cfg::LCD_COLS + 1];
@@ -180,11 +188,34 @@ static LiquidCrystal_I2C *g_lcd = nullptr;
 // ===========================================================================
 // Helpers
 // ===========================================================================
+static inline uint32_t msToPulseTicks(uint32_t durationMs) {
+    return ((durationMs * 1000UL) + (Cfg::PULSE_TIMER_TICK_US - 1UL)) / Cfg::PULSE_TIMER_TICK_US;
+}
+
+static inline void setGateAndLed(uint8_t idx, bool high) {
+    digitalWrite(Pins::GATE[idx], high ? HIGH : LOW);
+    digitalWrite(Pins::LED[idx],  high ? HIGH : LOW);
+}
+
+static inline uint8_t gatePortMaskFromState() {
+    uint8_t mask = 0;
+    if (g_ch[0].outputAsserted) mask |= _BV(3);
+    if (g_ch[1].outputAsserted) mask |= _BV(5);
+    if (g_ch[2].outputAsserted) mask |= _BV(1);
+    return mask;
+}
+
+static inline void syncGatePortFromState() {
+    const uint8_t gateMask = (uint8_t)(_BV(1) | _BV(3) | _BV(5));
+    PORTK = (uint8_t)((PORTK & (uint8_t)~gateMask) | gatePortMaskFromState());
+}
+
 static void forceAllOutputsLow() {
     for (uint8_t i = 0; i < 3; i++) {
-        digitalWrite(Pins::GATE[i], LOW);
-        digitalWrite(Pins::LED[i],  LOW);
+        g_ch[i].outputAsserted = false;
+        digitalWrite(Pins::LED[i], LOW);
     }
+    syncGatePortFromState();
 }
 
 static bool interlockOk() {
@@ -209,91 +240,166 @@ static TopState evaluateState() {
 }
 
 static void triggerEnableToggle(uint8_t idx) {
-    g_ch[idx].enaToggleStartMs = millis();
-    g_ch[idx].enaToggleActive  = true;
-    digitalWrite(Pins::ENA[idx], HIGH);
-}
-
-static void startPulse(uint8_t idx) {
-    Channel& c     = g_ch[idx];
-    c.pulsesLeft   = c.count;
-    c.phaseStartMs = millis();
-    c.inHighPhase  = true;
-    digitalWrite(Pins::GATE[idx], HIGH);
-    digitalWrite(Pins::LED[idx],  HIGH);
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        g_ch[idx].enaToggleTicksRemaining = msToPulseTicks(Cfg::ENA_TOGGLE_MS);
+        g_ch[idx].enaToggleActive         = true;
+        digitalWrite(Pins::ENA[idx], HIGH);
+    }
 }
 
 static void stopChannel(uint8_t idx) {
-    Channel& c    = g_ch[idx];
-    c.mode        = Mode::Off;
-    c.pulsesLeft  = 0;
-    c.inHighPhase = false;
-    digitalWrite(Pins::GATE[idx], LOW);
-    digitalWrite(Pins::LED[idx],  LOW);
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        Channel& c            = g_ch[idx];
+        g_modeSyncPendingMask &= (uint8_t)~(1U << idx);
+        g_applyEventPendingMask &= (uint8_t)~(1U << idx);
+        c.mode                = Mode::Off;
+        c.requestedMode       = Mode::Off;
+        c.pulsesLeft          = 0;
+        c.phaseTicksRemaining = 0;
+        c.inHighPhase         = false;
+        c.outputAsserted      = false;
+        c.applyPending        = false;
+        digitalWrite(Pins::LED[idx], LOW);
+    }
+    syncGatePortFromState();
 }
 
 // ===========================================================================
-// Channel state machines
+// Timer-driven pulse engine
 // ===========================================================================
-static void tickChannel(uint8_t idx) {
-    Channel& c = g_ch[idx];
+static void pulseTimerSetup() {
+    TCCR5A = 0;
+    TCCR5B = 0;
+    TCNT5  = 0;
+    OCR5A  = Cfg::PULSE_TIMER_OCR;
+    TCCR5B |= _BV(WGM52);  // CTC mode
+    TCCR5B |= _BV(CS51);   // prescaler 8
+    TIMSK5 |= _BV(OCIE5A); // compare A interrupt enable
+}
 
-    // Enable-toggle one-shot
-    if (c.enaToggleActive) {
-        if ((millis() - c.enaToggleStartMs) >= Cfg::ENA_TOGGLE_MS) {
+ISR(TIMER5_COMPA_vect) {
+    bool gateStateChanged = false;
+
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        Channel& c = g_ch[idx];
+        if (!c.enaToggleActive) continue;
+        if (c.enaToggleTicksRemaining > 0) c.enaToggleTicksRemaining--;
+        if (c.enaToggleTicksRemaining == 0) {
             digitalWrite(Pins::ENA[idx], LOW);
             c.enaToggleActive = false;
         }
     }
 
-    if (g_state != TopState::Ready) return;
+    uint8_t applyMask = g_applyEventPendingMask;
+    if (applyMask != 0) g_applyEventPendingMask = 0;
 
-    switch (c.mode) {
-        case Mode::Off:
-            break;
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if ((applyMask & (uint8_t)(1U << idx)) == 0) continue;
 
-        case Mode::DC:
-            // Pin held HIGH; nothing to tick
-            break;
+        Channel& c = g_ch[idx];
+        c.applyPending = false;
 
-        case Mode::Pulse:
-        case Mode::PulseTrain: {
-            if (c.pulsesLeft == 0) {
-                c.mode        = Mode::Off;
-                c.inHighPhase = false;
-                digitalWrite(Pins::GATE[idx], LOW);
-                digitalWrite(Pins::LED[idx],  LOW);
-                mb.cbDisable(); mb.Hreg(Reg::CH_MODE(idx + 1), 0); mb.cbEnable(true);
+        switch (c.requestedMode) {
+            case Mode::Off:
+                c.mode                = Mode::Off;
+                c.pulsesLeft          = 0;
+                c.phaseTicksRemaining = 0;
+                c.inHighPhase         = false;
+                c.outputAsserted      = false;
+                digitalWrite(Pins::LED[idx], LOW);
+                gateStateChanged = true;
                 break;
-            }
 
-            uint32_t elapsed = millis() - c.phaseStartMs;
+            case Mode::DC:
+                c.mode                = Mode::DC;
+                c.pulsesLeft          = 0;
+                c.phaseTicksRemaining = 0;
+                c.inHighPhase         = false;
+                c.outputAsserted      = true;
+                digitalWrite(Pins::LED[idx], HIGH);
+                gateStateChanged = true;
+                break;
 
-            if (c.inHighPhase) {
-                if (elapsed >= c.pulseMs) {
-                    digitalWrite(Pins::GATE[idx], LOW);
-                    digitalWrite(Pins::LED[idx],  LOW);
-                    c.pulsesLeft--;
-                    if (c.pulsesLeft == 0) {
-                        c.mode        = Mode::Off;
-                        c.inHighPhase = false;
-                        mb.cbDisable(); mb.Hreg(Reg::CH_MODE(idx + 1), 0); mb.cbEnable(true);
-                    } else {
-                        c.inHighPhase  = false;
-                        c.phaseStartMs = millis();
-                    }
-                }
-            } else {
-                if (elapsed >= c.pulseMs) {
-                    c.inHighPhase  = true;
-                    c.phaseStartMs = millis();
-                    digitalWrite(Pins::GATE[idx], HIGH);
-                    digitalWrite(Pins::LED[idx],  HIGH);
-                }
-            }
-            break;
+            case Mode::Pulse:
+            case Mode::PulseTrain:
+                c.mode                = c.requestedMode;
+                c.pulsesLeft          = c.count;
+                c.phaseTicksRemaining = msToPulseTicks(c.pulseMs);
+                c.inHighPhase         = true;
+                c.outputAsserted      = true;
+                digitalWrite(Pins::LED[idx], HIGH);
+                gateStateChanged = true;
+                break;
         }
     }
+
+    if (gateStateChanged) {
+        syncGatePortFromState();
+        gateStateChanged = false;
+    }
+
+    if (!g_pulseOutputsEnabled) return;
+
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        Channel& c = g_ch[idx];
+        if ((applyMask & (uint8_t)(1U << idx)) != 0) continue;
+        if (c.mode != Mode::Pulse && c.mode != Mode::PulseTrain) continue;
+
+        if (c.inHighPhase && !c.outputAsserted) {
+            c.outputAsserted = true;
+            digitalWrite(Pins::LED[idx], HIGH);
+            gateStateChanged = true;
+        }
+
+        if (c.phaseTicksRemaining > 0) c.phaseTicksRemaining--;
+        if (c.phaseTicksRemaining > 0) continue;
+
+        if (c.inHighPhase) {
+            c.outputAsserted = false;
+            digitalWrite(Pins::LED[idx], LOW);
+            gateStateChanged = true;
+            if (c.pulsesLeft > 0) c.pulsesLeft--;
+            if (c.pulsesLeft == 0) {
+                c.mode                = Mode::Off;
+                c.requestedMode       = Mode::Off;
+                c.inHighPhase         = false;
+                c.phaseTicksRemaining = 0;
+                g_modeSyncPendingMask |= (uint8_t)(1U << idx);
+            } else {
+                c.inHighPhase         = false;
+                c.phaseTicksRemaining = msToPulseTicks(c.pulseMs);
+            }
+        } else {
+            c.inHighPhase = true;
+            c.outputAsserted      = true;
+            c.phaseTicksRemaining = msToPulseTicks(c.pulseMs);
+            digitalWrite(Pins::LED[idx], HIGH);
+            gateStateChanged = true;
+        }
+    }
+
+    if (gateStateChanged) syncGatePortFromState();
+}
+
+static void syncRuntimeModeToRegisters() {
+    uint8_t pendingMask = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        pendingMask = g_modeSyncPendingMask;
+        g_modeSyncPendingMask = 0;
+    }
+    if (!pendingMask) return;
+
+    mb.cbDisable();
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if ((pendingMask & (uint8_t)(1U << idx)) != 0) {
+            Mode mode = Mode::Off;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                mode = g_ch[idx].mode;
+            }
+            if (mode == Mode::Off) mb.Hreg(Reg::CH_MODE(idx + 1), 0);
+        }
+    }
+    mb.cbEnable(true);
 }
 
 static void applyDC() {
@@ -303,10 +409,11 @@ static void applyDC() {
     }
     for (uint8_t i = 0; i < 3; i++) {
         if (g_ch[i].mode == Mode::DC) {
-            digitalWrite(Pins::GATE[i], HIGH);
-            digitalWrite(Pins::LED[i],  HIGH);
+            g_ch[i].outputAsserted = true;
+            digitalWrite(Pins::LED[i], HIGH);
         }
     }
+    syncGatePortFromState();
 }
 
 // ===========================================================================
@@ -315,37 +422,12 @@ static void applyDC() {
 static void handleModeWrite(uint8_t idx, uint16_t val) {
     Mode newMode = (Mode)(val & 0x03);
 
-    // Use evaluateState() directly — g_state is stale inside mb.task() callbacks
-    // (it is only refreshed in loop() after mb.task() returns).
-    if (newMode != Mode::Off && evaluateState() != TopState::Ready) {
-        g_lastError = 10;
-        mb.Hreg(Reg::LAST_ERROR, g_lastError);
-        // Do NOT call mb.Hreg(CH_MODE, …) here — the library triggers ON_SET callbacks
-        // on Hreg writes, which would recurse back into this callback indefinitely.
-        // The cbSetCHxMode return value (g_ch[idx].mode, unchanged) restores the register.
-        return;
-    }
+    if (newMode == Mode::Pulse && g_ch[idx].count > 1) newMode = Mode::PulseTrain;
 
-    g_ch[idx].mode = newMode;
-
-    if (newMode == Mode::Off) {
-        g_ch[idx].pulsesLeft  = 0;
-        g_ch[idx].inHighPhase = false;
-        digitalWrite(Pins::GATE[idx], LOW);
-        digitalWrite(Pins::LED[idx],  LOW);
-
-    } else if (newMode == Mode::DC) {
-        g_ch[idx].pulsesLeft  = 0;
-        g_ch[idx].inHighPhase = false;
-        digitalWrite(Pins::GATE[idx], HIGH);
-        digitalWrite(Pins::LED[idx],  HIGH);
-
-    } else {
-        // Auto-elevate Pulse → PulseTrain when count > 1.
-        // No mb.Hreg(CH_MODE, …) call here — cbSetCHxMode returns g_ch[idx].mode
-        // which is what the library stores in the register.
-        if (g_ch[idx].count > 1) g_ch[idx].mode = Mode::PulseTrain;
-        startPulse(idx);
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        g_modeSyncPendingMask &= (uint8_t)~(1U << idx);
+        g_ch[idx].requestedMode = newMode;
+        g_ch[idx].applyPending = true;
     }
 }
 
@@ -377,6 +459,28 @@ uint16_t cbSetCommand(TRegister* reg, uint16_t val) {
             for (uint8_t i = 0; i < 3; i++) mb.Hreg(Reg::CH_MODE(i + 1), 0);
             mb.cbEnable(true);
             break;
+        case 4: {
+            uint8_t applyMask = 0;
+            uint8_t startMask = 0;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                for (uint8_t i = 0; i < 3; i++) {
+                    if (!g_ch[i].applyPending) continue;
+                    applyMask |= (uint8_t)(1U << i);
+                    if (g_ch[i].requestedMode != Mode::Off) startMask |= (uint8_t)(1U << i);
+                }
+            }
+
+            if (startMask != 0 && evaluateState() != TopState::Ready) {
+                g_lastError = 10;
+                mb.Hreg(Reg::LAST_ERROR, g_lastError);
+                applyMask &= (uint8_t)~startMask;
+            }
+
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                g_applyEventPendingMask |= applyMask;
+            }
+            break;
+        }
         case 2: case 3:
             if (!interlockOk()) { g_lastError = 12; mb.Hreg(Reg::LAST_ERROR, g_lastError); }
             else g_faultLatched = false;
@@ -386,43 +490,41 @@ uint16_t cbSetCommand(TRegister* reg, uint16_t val) {
     return 0;
 }
 
-// Return g_ch[idx].mode (may differ from val due to Pulse→PulseTrain elevation);
-// the library stores the callback return value — this is the ONLY safe way to
-// update the control register because mb.Hreg(CH_MODE, …) inside a callback
-// would re-trigger this same callback (infinite recursion).
-uint16_t cbSetCH1Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(0, val); return (uint16_t)g_ch[0].mode; }
-uint16_t cbSetCH2Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(1, val); return (uint16_t)g_ch[1].mode; }
-uint16_t cbSetCH3Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(2, val); return (uint16_t)g_ch[2].mode; }
+// CH_MODE writes now stage requested modes. COMMAND=4 applies all pending
+// channels together on the next timer event.
+uint16_t cbSetCH1Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(0, val); return (uint16_t)g_ch[0].requestedMode; }
+uint16_t cbSetCH2Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(1, val); return (uint16_t)g_ch[1].requestedMode; }
+uint16_t cbSetCH3Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(2, val); return (uint16_t)g_ch[2].requestedMode; }
 
 uint16_t cbSetCH1PulseMs(TRegister* reg, uint16_t val) {
     feedWatchdog();
-    if (val >= Cfg::PULSE_MS_MIN && val <= Cfg::PULSE_MS_MAX) { g_ch[0].pulseMs = val; return val; }
+    if (val >= Cfg::PULSE_MS_MIN && val <= Cfg::PULSE_MS_MAX) { ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { g_ch[0].pulseMs = val; } return val; }
     g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError); return (uint16_t)g_ch[0].pulseMs;
 }
 uint16_t cbSetCH2PulseMs(TRegister* reg, uint16_t val) {
     feedWatchdog();
-    if (val >= Cfg::PULSE_MS_MIN && val <= Cfg::PULSE_MS_MAX) { g_ch[1].pulseMs = val; return val; }
+    if (val >= Cfg::PULSE_MS_MIN && val <= Cfg::PULSE_MS_MAX) { ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { g_ch[1].pulseMs = val; } return val; }
     g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError); return (uint16_t)g_ch[1].pulseMs;
 }
 uint16_t cbSetCH3PulseMs(TRegister* reg, uint16_t val) {
     feedWatchdog();
-    if (val >= Cfg::PULSE_MS_MIN && val <= Cfg::PULSE_MS_MAX) { g_ch[2].pulseMs = val; return val; }
+    if (val >= Cfg::PULSE_MS_MIN && val <= Cfg::PULSE_MS_MAX) { ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { g_ch[2].pulseMs = val; } return val; }
     g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError); return (uint16_t)g_ch[2].pulseMs;
 }
 
 uint16_t cbSetCH1Count(TRegister* reg, uint16_t val) {
     feedWatchdog();
-    if (val >= Cfg::COUNT_MIN && val <= Cfg::COUNT_MAX) { g_ch[0].count = val; return val; }
+    if (val >= Cfg::COUNT_MIN && val <= Cfg::COUNT_MAX) { ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { g_ch[0].count = val; } return val; }
     g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError); return (uint16_t)g_ch[0].count;
 }
 uint16_t cbSetCH2Count(TRegister* reg, uint16_t val) {
     feedWatchdog();
-    if (val >= Cfg::COUNT_MIN && val <= Cfg::COUNT_MAX) { g_ch[1].count = val; return val; }
+    if (val >= Cfg::COUNT_MIN && val <= Cfg::COUNT_MAX) { ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { g_ch[1].count = val; } return val; }
     g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError); return (uint16_t)g_ch[1].count;
 }
 uint16_t cbSetCH3Count(TRegister* reg, uint16_t val) {
     feedWatchdog();
-    if (val >= Cfg::COUNT_MIN && val <= Cfg::COUNT_MAX) { g_ch[2].count = val; return val; }
+    if (val >= Cfg::COUNT_MIN && val <= Cfg::COUNT_MAX) { ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { g_ch[2].count = val; } return val; }
     g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError); return (uint16_t)g_ch[2].count;
 }
 
@@ -446,12 +548,21 @@ uint16_t cbGetLastError   (TRegister* reg, uint16_t val) {
 }
 
 static uint16_t liveChField(uint8_t idx, uint8_t field) {
-    const Channel& c = g_ch[idx];
+    uint32_t pulseMs = 0;
+    uint32_t count = 0;
+    uint32_t pulsesLeft = 0;
+    Mode mode = Mode::Off;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        mode = g_ch[idx].mode;
+        pulseMs = g_ch[idx].pulseMs;
+        count = g_ch[idx].count;
+        pulsesLeft = g_ch[idx].pulsesLeft;
+    }
     switch (field) {
-        case 0: return (uint16_t)c.mode;
-        case 1: return (uint16_t)c.pulseMs;
-        case 2: return (uint16_t)c.count;
-        case 3: return (uint16_t)c.pulsesLeft;
+        case 0: return (uint16_t)mode;
+        case 1: return (uint16_t)pulseMs;
+        case 2: return (uint16_t)count;
+        case 3: return (uint16_t)pulsesLeft;
         case 4: case 5: case 6: case 7: return 0;  // not wired in HW rev 2026-03-17
         case 8: return (digitalRead(Pins::GATE[idx]) == HIGH) ? 1 : 0;
         default: return 0;
@@ -597,13 +708,18 @@ static void lcdUpdate() {
 
     // Rows 1-3: per channel
     for (uint8_t i = 0; i < 3; i++) {
-        const Channel& c = g_ch[i];
+        Mode mode = Mode::Off;
+        uint32_t pulsesLeft = 0;
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            mode = g_ch[i].mode;
+            pulsesLeft = g_ch[i].pulsesLeft;
+        }
         snprintf(g_lcdBuf[i + 1], Cfg::LCD_COLS + 1,
                  "CH%d %s O:%d R:%-5u   ",
                  i + 1,
-                 modeAbbrev(c.mode),
+                 modeAbbrev(mode),
                  (digitalRead(Pins::GATE[i]) == HIGH) ? 1 : 0,
-                 (unsigned int)(c.pulsesLeft & 0xFFFFu));
+                 (unsigned int)(pulsesLeft & 0xFFFFu));
     }
 
     // Write only changed rows; keep TWI enabled between refreshes.
@@ -650,6 +766,8 @@ void setup() {
     lcdInit();
 #endif
 
+    pulseTimerSetup();
+
     // SW watchdog first feed
     feedWatchdog();
 
@@ -671,16 +789,16 @@ void loop() {
 #endif
 
     mb.task();
+    syncRuntimeModeToRegisters();
 
     g_state = evaluateState();
+    g_pulseOutputsEnabled = (g_state == TopState::Ready);
 
     if (g_state != TopState::Ready) {
         forceAllOutputsLow();
     } else {
         applyDC();
     }
-
-    for (uint8_t i = 0; i < 3; i++) tickChannel(i);
 
 #if BCON_ENABLE_LCD
     lcdUpdate();

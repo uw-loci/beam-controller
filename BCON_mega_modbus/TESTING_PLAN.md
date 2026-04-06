@@ -18,7 +18,7 @@ Current firmware assumptions:
 
 Current contract details that matter for testing:
 
-- Register `2` (`COMMAND`) is `0=NOP`, `1=AllOff`, `2/3=ClearFault`
+- Register `2` (`COMMAND`) is `0=NOP`, `1=AllOff`, `2/3=ClearFault`, `4=ApplyStagedModes`
 - `SYS_STATE` is the watchdog keepalive read path
 - `LAST_ERROR` auto-clears on read
 - Channel status offsets `4-7` are intentionally not wired and should read `0`
@@ -56,14 +56,15 @@ Host-side note:
 - [ ] REG-003 `LAST_ERROR` auto-clear behavior
 - [ ] CMD-001 `COMMAND=0` NOP
 - [ ] CMD-002 `COMMAND=1` AllOff
-- [ ] CMD-003 `COMMAND=3` ClearFault with interlock LOW and HIGH
+- [ ] CMD-003 `COMMAND=4` ApplyStagedModes
+- [ ] CMD-004 `COMMAND=3` ClearFault with interlock LOW and HIGH
 - [ ] CH-001 DC mode output
 - [ ] CH-002 Single pulse timing
 - [ ] CH-003 Pulse auto-promotes to PulseTrain when count > 1
 - [ ] CH-004 Enable-toggle 100 ms pulse
 - [ ] SAFE-001 Interlock safe state
 - [ ] SAFE-002 Watchdog expiry and keepalive path
-- [ ] SAFE-003 Non-Ready mode-write rejection
+- [ ] SAFE-005 Non-Ready apply rejection
 - [ ] LCD-001 LCD detect and quiet-window update
 - [ ] GUI-001 Updated GUI interoperability smoke test
 
@@ -203,7 +204,22 @@ Verify:
 - All three `CH_MODE` control registers are forced to `0`
 - Live status mode also returns `OFF`
 
-### CMD-003 - `COMMAND=2` and `COMMAND=3` ClearFault
+### CMD-003 - `COMMAND=4` ApplyStagedModes
+
+Procedure:
+
+1. Set interlock HIGH
+2. Write channel parameters as needed
+3. Write one or more `CH_MODE` control registers
+4. Write `COMMAND=4`
+
+Verify:
+
+- No output changes occur on the `CH_MODE` write alone
+- The staged channels become active together only after `COMMAND=4`
+- For pulse completion, the control register still returns to `OFF` through the deferred main-loop sync
+
+### CMD-004 - `COMMAND=2` and `COMMAND=3` ClearFault
 
 Verify current behavior:
 
@@ -221,6 +237,12 @@ Important note:
 
 Use an oscilloscope for all pulse timing checks.
 
+Implementation note:
+
+- The `PULSE_MS` register remains in milliseconds, but the runtime pulse engine is now driven by a Timer5 compare interrupt on the ATmega2560 rather than by main-loop timing.
+- The timer engine owns pulse high/low transitions and enable-toggle timing.
+- Pulse completion updates the exposed `CH_MODE` register back to `OFF` through a deferred main-loop sync, not directly from interrupt context.
+
 ### CH-001 - DC Mode
 
 Procedure:
@@ -228,6 +250,7 @@ Procedure:
 1. Set interlock HIGH
 2. Keep watchdog alive
 3. Write `CH_MODE=1`
+4. Write `COMMAND=4`
 
 Verify:
 
@@ -243,6 +266,7 @@ Procedure:
 1. Write `PULSE_MS=500`
 2. Write `COUNT=1`
 3. Write `MODE=2`
+4. Write `COMMAND=4`
 
 Verify:
 
@@ -258,6 +282,7 @@ Procedure:
 1. Write `PULSE_MS=200`
 2. Write `COUNT=5`
 3. Write `MODE=2` (`Pulse`)
+4. Write `COMMAND=4`
 
 Verify:
 
@@ -271,6 +296,7 @@ Procedure:
 
 1. Write `MODE=3`
 2. Test with `COUNT=5`
+3. Write `COMMAND=4`
 
 Verify:
 
@@ -353,16 +379,18 @@ Confirm priority order in `evaluateState()`:
 3. `FaultLatched`
 4. `Ready`
 
-### SAFE-005 - Non-Ready Mode Write Rejection
+### SAFE-005 - Non-Ready Apply Rejection
 
 Procedure:
 
 1. Make the controller non-ready by opening the interlock or letting the watchdog expire
-2. Attempt to write `MODE=1`, `2`, or `3`
+2. Stage `MODE=1`, `2`, or `3`
+3. Write `COMMAND=4`
 
 Verify:
 
-- The mode write is rejected
+- The staged mode write is accepted into the control register
+- The apply command is rejected
 - `LAST_ERROR=10`
 - The existing channel mode remains unchanged
 
@@ -371,7 +399,7 @@ Verify:
 Verify current behavior after returning to `Ready`:
 
 - DC channels resume HIGH because the mode remains `DC`
-- Pulse and pulse-train channels should be characterized and documented because their timing state is not explicitly paused during non-ready intervals
+- Pulse and pulse-train channels should resume from the timer-engine state they had when the controller left `Ready`; countdown does not continue while outputs are suppressed
 
 ---
 
@@ -474,14 +502,22 @@ Verify:
 - The GUI sends `COMMAND=3`
 - The GUI no longer presents an arm/disarm workflow that the firmware does not support
 
-### GUI-003 - Stop Paths
+### GUI-003 - Staged Start Path
+
+Verify:
+
+- Single-channel apply stages `CH_MODE` then sends `COMMAND=4`
+- Sync start stages all selected channel modes and sends one `COMMAND=4`
+- CSV sequence steps stage their channel modes and send one `COMMAND=4` per step
+
+### GUI-004 - Stop Paths
 
 Verify:
 
 - Sync Stop uses `COMMAND=1`
 - Stopping a running CSV sequence forces `AllOff`
 
-### GUI-004 - Error Visibility
+### GUI-005 - Error Visibility
 
 Verify:
 

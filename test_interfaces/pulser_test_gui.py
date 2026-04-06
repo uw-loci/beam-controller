@@ -85,6 +85,7 @@ MODE_LABEL_TO_CODE = {
 
 COMMAND_NOP = 0
 COMMAND_ALL_OFF = 1
+COMMAND_APPLY_STAGED = 4
 COMMAND_CLEAR_FAULT = 3
 
 WATCHDOG_MIN_MS = 50
@@ -432,7 +433,7 @@ class PulserApp(ctk.CTk):
             pulses_lbl = ctk.CTkLabel(frame, text="Pulses: 0", anchor="w")
             pulses_lbl.grid(row=3, column=2, columnspan=2, sticky="w", pady=(8,4))
 
-            btn_apply = ctk.CTkButton(frame, text="Apply Params + Mode", width=120, command=lambda ch=ch, cE=cnt_entry, d=dur_entry, m=mode_cb: self._apply_channel(ch, d, cE, m))
+            btn_apply = ctk.CTkButton(frame, text="Apply Params + Start", width=120, command=lambda ch=ch, cE=cnt_entry, d=dur_entry, m=mode_cb: self._apply_channel(ch, d, cE, m))
             btn_apply.grid(row=4, column=0, columnspan=2, pady=6, padx=(0, 4), sticky="ew")
             btn_stop = ctk.CTkButton(frame, text="Off", fg_color="#e74c3c", command=lambda ch=ch: self._set_mode(ch, MODE_OFF))
             btn_stop.grid(row=4, column=2, pady=6, padx=4, sticky="ew")
@@ -689,6 +690,10 @@ class PulserApp(ctk.CTk):
         self.modbus.enqueue_write(REG_COMMAND, command)
         self._log_event(description)
 
+    def _queue_apply_event(self, description):
+        self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED)
+        self._log_event(description)
+
     def _clear_fault(self):
         if not self.modbus.connected:
             messagebox.showwarning("Clear Fault", "Not connected to device.")
@@ -716,7 +721,9 @@ class PulserApp(ctk.CTk):
         self.modbus.enqueue_write(base + CH_COUNT_OFF, count)
         self.modbus.enqueue_write(base + CH_MODE_OFF, mode_code)
         self.channel_vars[ch]['mode'].set(mode_label)
-        self._log_event(f"Applied CH{ch+1}: mode={mode_label} duration_ms={duration} count={count}")
+        self._queue_apply_event(
+            f"Applied CH{ch+1}: mode={mode_label} duration_ms={duration} count={count}"
+        )
 
     def _set_mode(self, ch, mode):
         base = CH_BASE[ch]
@@ -729,7 +736,7 @@ class PulserApp(ctk.CTk):
             MODE_PULSE: "PULSE",
             MODE_PULSE_TRAIN: "PULSE_TRAIN",
         }.get(mode, str(mode))
-        self._log_event(f"CMD CH{ch+1} -> {mode_name}")
+        self._queue_apply_event(f"CMD CH{ch+1} -> {mode_name}")
 
     def _toggle_enable(self, ch):
         base = CH_BASE[ch]
@@ -767,16 +774,15 @@ class PulserApp(ctk.CTk):
         """Apply each channel's individual config, then start all selected channels.
 
         Strategy for minimising inter-channel start jitter:
-          Phase 1 – write all duration/count values for every selected channel.
-          Phase 2 – write mode (start command) for every selected channel.
-        Both phases are enqueued atomically so no other write can interleave.
+          Phase 1 - write all duration/count values for every selected channel.
+          Phase 2 - stage mode writes for every selected channel.
+          Phase 3 - issue one apply command so firmware starts them together.
         """
         selected = [ch for ch in range(3) if self.sync_ch_vars[ch].get()]
         if not selected:
             self._log_event("Sync Start: no channels checked")
             return
 
-        # Validate all channels before enqueuing anything
         params = {}
         for ch in selected:
             cfg = self.sync_configs[ch]
@@ -796,15 +802,15 @@ class PulserApp(ctk.CTk):
             params[ch] = (dur, cnt, mode_code, mode_label)
             self.sync_configs[ch]['mode'].set(mode_label)
 
-        # Phase 1: write duration + count for all channels (params must be set before mode)
         for ch, (dur, cnt, mode_code, _) in params.items():
             if mode_code not in (MODE_OFF, MODE_DC):
                 self.modbus.enqueue_write(CH_BASE[ch] + CH_PULSE_MS_OFF, dur)
                 self.modbus.enqueue_write(CH_BASE[ch] + CH_COUNT_OFF, cnt)
 
-        # Phase 2: write mode for all channels — keeps mode writes as close together as possible
         for ch, (_, _, mode_code, _) in params.items():
             self.modbus.enqueue_write(CH_BASE[ch] + CH_MODE_OFF, mode_code)
+
+        self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED)
 
         self._log_event(
             "Sync Start: " +
@@ -946,11 +952,12 @@ class PulserApp(ctk.CTk):
                 self.modbus.enqueue_write(base + CH_PULSE_MS_OFF, row["duration_ms"])
                 self.modbus.enqueue_write(base + CH_COUNT_OFF, row["count"])
 
-            # Phase 2: write modes together to minimise inter-channel start jitter
+            # Phase 2: stage modes together, then apply once
             for row in rows:
                 self.modbus.enqueue_write(
                     CH_BASE[row["ch"]] + CH_MODE_OFF, MODE_LABEL_TO_CODE[row["mode"]]
                 )
+            self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED)
 
             # Dwell in small slices so stop is responsive
             deadline = time.time() + dwell_ms / 1000.0
