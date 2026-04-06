@@ -344,3 +344,18 @@ LCD I2C:             SDA(20), SCL(21) - used in bit-bang recovery only
 3. **Watchdog Grace Period**: 8-second grace window may be too long for some applications - consider making it configurable.
 
 4. **Unsupported Function Codes**: Only FC 0x03, 0x06, and 0x10 are implemented. Any other function code (e.g., FC 0x01, 0x02) returns Modbus exception 0x01 (Illegal Function) — not silently ignored.
+
+5. **Regression tests added for callback recursion and callback disabling**:
+    - Verify `Reg::WATCHDOG_MS` and `Reg::TELEMETRY_MS` registers are at addresses 0 and 1, not the timeout default values.
+    - Verify `cbSetCHxMode` does not call `mb.Hreg(Reg::CH_MODE(...), ...)` during ON_SET callback; the answer is returned via callback return value.
+    - Verify `handleModeWrite` uses live `evaluateState()` and rejects non-Ready mode writes correctly (fault safe behavior) without entering recursion.
+    - Verify `cbSetCommand` with value 1 (AllOff) disables callbacks during channel register writes and does not trigger `cbSetCHxMode` recursively.
+    - Verify `tickChannel` state-transition mode write uses cbDisable/cbEnable around direct register set to avoid reentrancy.
+
+6. **Read/Write Watchdog expectation**:
+    - `cbGetSysState` should feed the watchdog on each read. Test that polling FC03 on 100 works as heartbeat.
+    - GUI heartbeat write path: every third poll triggers `REG_COMMAND=0` NOP, enabling recovery if read path is briefly interrupted.
+
+7. **README consistency checks:**
+    - Confirm README statement “any valid Modbus frame counts as keepalive” is true: read (FC03) and write (FC06/0x10 + callback path) update `g_wdLastFeedMs`.
+    - Confirm handshake fallback and safe-state behavior are described (SafeWatchdog/SafeInterlock/FaultLatched).
