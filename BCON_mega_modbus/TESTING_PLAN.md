@@ -1,361 +1,525 @@
-# BCON Mega Modbus - Comprehensive Testing Plan
+# BCON Mega Modbus - Current Firmware Test Plan
 
-## Test Overview
+This plan matches the current source in `BCON_mega_modbus.ino` and `bcon_types.h`.
+It replaces the older plan that targeted the retired custom Modbus implementation.
 
-| Component | Priority | Notes |
-|-----------|----------|-------|
-| System Init | High | Boot behavior, reset flags, WDT setup |
-| Modbus Comms | High | All function codes, error handling |
-| Output Control | Critical | DC mode validation critical for safety |
-| Watchdog/Interlock | High | Safety features must work correctly |
-| Fault Management | High | Latching behavior must be reliable |
-| LCD Display | Medium | Diagnostic display, not safety-critical |
+## Scope
 
-### Quick Checkboxes
-- [ ] INIT-001 Boot Sequence
-- [ ] INIT-002 I2C Bus Recovery
-- [ ] INIT-003 Watchdog Grace Period
-- [ ] RC-001 Read single register
-- [ ] RC-002 Read multi-register batch
-- [ ] RC-003 Read gap addresses handling
-- [ ] WC-001 Watchdog bounds validation
-- [ ] WM-001 Write multiple registers success
-- [ ] BC-001 Broadcast write behavior
-- [ ] DC mode and timing tests
-- [ ] Pulse and pulse-train tests
-- [ ] Watchdog and interlock safety tests
-- [ ] Fault management and clear sequence
-- [ ] LCD activity and content verification
-- [ ] Edge cases (overflow, CRC, timing)
+Current firmware assumptions:
 
----
+- Target: Arduino Mega 2560
+- Default transport for bench work: `BCON_USE_USB_SERIAL = 1`
+- Optional production transport: `BCON_USE_USB_SERIAL = 0` on `Serial1` with `RS485_DE_RE = 17`
+- LCD enabled in current bench build: `BCON_ENABLE_LCD = 1`
+- Slave ID: `1`
+- Baud rate: `115200`
+- Watchdog default: `1500 ms`
+- Watchdog grace period: `8000 ms`
 
-## 1. System Initialization Tests
+Current contract details that matter for testing:
 
-### Test Case: INIT-001 - Boot Sequence Verification
-**Setup:** Fresh firmware upload to Arduino Mega
-**Verify:** 
-- Watchdog disabled during .init3 phase (MCUSR captured)
-- RS485 port configured correctly (Serial vs Serial1 based on BCON_MODBUS_USE_USB_SERIAL)
-- All output pins initialized LOW as specified in `setup()`
+- Register `2` (`COMMAND`) is `0=NOP`, `1=AllOff`, `2/3=ClearFault`
+- `SYS_STATE` is the watchdog keepalive read path
+- `LAST_ERROR` auto-clears on read
+- Channel status offsets `4-7` are intentionally not wired and should read `0`
+- `Pulse` is auto-promoted to `PulseTrain` when `COUNT > 1`
+- `g_faultLatched` exists, but the current source has no hardware fault input path that asserts it during normal bench testing
 
-### Test Case: INIT-002 - I2C Bus Recovery
-**Setup:** Simulate stuck SDA line by holding it low externally before power-on
-**Verify:** Firmware performs bit-bang recovery (9 clock pulses on pin 21) and successfully initializes LCD if present
+## Recommended Bench Setup
 
-### Test Case: INIT-003 - Watchdog Grace Period
-**Verify:** `Runtime::watchdogGraceDeadlineMs = millis() + WATCHDOG_BOOT_GRACE_MS` (8000ms)
-**Verify:** System stays in READY state during grace period even without host communication
+Required equipment:
 
----
+1. Oscilloscope for gate and enable-toggle timing checks
+2. Multimeter for steady-state DC output checks
+3. Bench interlock source so pin `A0` can be driven HIGH and LOW on demand
+4. Modbus master tool or the updated GUI in `test_interfaces/pulser_test_gui.py`
 
-## 2. Modbus Communication Tests
+Recommended hookup notes:
 
-### 2.1 Read Holding Registers (Function Code 0x03)
+- Gate outputs: `A11`, `A13`, `A9`
+- Gate indicator LEDs: `3`, `5`, `7`
+- Enable-toggle outputs: `12`, `11`, `10`
+- Interlock input: `A0`, active HIGH, no pull-up enabled in firmware
+- LCD I2C: `SDA=20`, `SCL=21`
 
-| Test | Register Range | Expected Behavior |
-|------|----------------|-------------------|
-| RC-001 | Single register read | Returns correct value per `readHoldingRegister()` |
-| RC-002 | Multi-register batch (max 125) | Returns all values without exceptions |
-| RC-003 | Read gap addresses (3-9, 14-19, etc.) | Returns **0** instead of exception - prevents bulk read failures |
-| RC-004 | System status registers | Correct TOP_LEVEL_STATE and reason codes returned |
+Host-side note:
 
-### 2.2 Write Holding Registers (Function Code 0x06)
+- Opening the USB serial port resets the Mega via DTR. Wait about `2.5 s` after connect before issuing the first Modbus command.
 
-| Test | Register | Value Range | Expected Behavior |
-|------|----------|-------------|-------------------|
-| WC-001 | REG_WATCHDOG_MS | <50ms or >60s | **Returns exception 0x03** (IllegalValue) |
-| WC-002 | REG_TELEMETRY_MS | Any valid uint16 | Accepts, updates Runtime::telemetryPeriodMs |
-| WC-003 | REG_COMMAND=1 | Value=1 | All channels OFF immediately |
-| WC-004 | REG_COMMAND=2/3 with fault active | Fault still asserted | **Returns exception 0x04** (FaultStillActive) - prevents unsafe clearing |
+## Quick Checklist
 
-### 2.3 Write Multiple Registers (Function Code 0x10)
-
-| Test | Scenario | Expected Behavior |
-|------|----------|-------------------|
-| WM-001 | Valid multi-register write | All registers updated successfully |
-| WM-002 | Invalid byte count mismatch | Returns exception 0x03 before any writes |
-| WM-003 | Write to invalid address mid-batch | Stops at error, returns exception (partial update) |
-
-### 2.4 Broadcast Writes (Address=0)
-
-| Test | Scenario | Verify |
-|------|----------|--------|
-| BC-001 | Broadcast write with valid data | No acknowledgment frame sent back |
-| BC-002 | Broadcast to invalid address | No response expected |
+- [ ] INIT-001 Boot safe outputs low
+- [ ] INIT-002 Bench transport selection verified
+- [ ] INIT-003 Watchdog grace behavior with interlock HIGH and LOW
+- [ ] REG-001 GUI-compatible register block reads
+- [ ] REG-002 Illegal-address read across channel-status gaps
+- [ ] REG-003 `LAST_ERROR` auto-clear behavior
+- [ ] CMD-001 `COMMAND=0` NOP
+- [ ] CMD-002 `COMMAND=1` AllOff
+- [ ] CMD-003 `COMMAND=3` ClearFault with interlock LOW and HIGH
+- [ ] CH-001 DC mode output
+- [ ] CH-002 Single pulse timing
+- [ ] CH-003 Pulse auto-promotes to PulseTrain when count > 1
+- [ ] CH-004 Enable-toggle 100 ms pulse
+- [ ] SAFE-001 Interlock safe state
+- [ ] SAFE-002 Watchdog expiry and keepalive path
+- [ ] SAFE-003 Non-Ready mode-write rejection
+- [ ] LCD-001 LCD detect and quiet-window update
+- [ ] GUI-001 Updated GUI interoperability smoke test
 
 ---
 
-## 3. Output Control Tests
+## 1. Initialization and Build Tests
 
-**Critical: Use oscilloscope for pulse timing validation**
+### INIT-001 - Boot Sequence and Safe Outputs
 
-### 3.1 DC Mode (Mode=1)
+Setup:
 
-```cpp
-// Test: Set channel mode to DC, verify continuous HIGH on gate output pin
-```
+- Fresh power-on or reset
+- Observe gate outputs and enable-toggle outputs at boot
 
-| Check | Expected |
-|-------|----------|
-| Gate pin state | Continuous HIGH after command accepted |
-| Channel timer | Cleared (no countdown running) |
-| Enable toggle | Pulses if enable_status input is LOW |
+Verify:
 
-### 3.2 Pulse Mode (Mode=2, count=1)
+- `captureAndDisableWdt()` runs early enough that a watchdog-caused reboot does not loop forever
+- All gate outputs start LOW
+- All gate LED outputs start LOW
+- All enable-toggle outputs start LOW
 
-```cpp
-// Test: Set pulse duration to 500ms, verify single pulse output
-```
+Pass criteria:
 
-| Check | Expected |
-|-------|----------|
-| Initial state | Gate HIGH immediately |
-| After pulse duration | Gate returns LOW automatically |
-| pulsesRemaining | Decrements from 1→0, then mode becomes OFF |
-| Timer behavior | Single channel timer armed for durationMs |
+- No output pin glitches HIGH during boot
+- Device reaches a stable Modbus-ready state after boot
 
-### 3.3 Pulse Train Mode (Mode=3)
+### INIT-002 - Transport Configuration
 
-```cpp
-// Test: Set pulse train with duration=200ms, count=5
-```
+Bench build test:
 
-| Check | Expected |
-|-------|----------|
-| Pattern observed on oscilloscope | HIGH(200ms) → LOW(200ms gap) × 4 → HIGH(200ms) → LOW (stop) |
-| pulsesRemaining | Counts down correctly through interrupts |
-| State transitions | MODE→PULSE_TRAIN→OFF as designed |
+- With `BCON_USE_USB_SERIAL = 1`, verify Modbus works on USB serial
 
-### 3.4 Output Priority Tests
+Optional production build test:
 
-```cpp
-// Test: Command DC mode, then immediately send watchdog timeout scenario
-```
+- With `BCON_USE_USB_SERIAL = 0`, verify Modbus works on `Serial1`
+- Verify DE/RE pin `17` controls RS-485 direction correctly
 
-| Check | Expected |
-|-------|----------|
-| When watchdog expires | **All outputs forced LOW** (applyOutputs() checks TopLevelState) |
-| After watchdog restored via heartbeat | Outputs resume per current channel commands |
+### INIT-003 - Watchdog Grace Period
 
----
+Setup:
 
-## 4. Watchdog & Interlock Tests
+- Power cycle the board
+- Do not send host traffic for the first 8 seconds
 
-### 4.1 Software Watchdog Behavior
+Verify:
 
-| Test Case | Scenario | Verify |
-|-----------|----------|--------|
-| WD-001 | No host communication for >WATCHDOG_TIMEOUT_MS (default 1500ms) | All outputs forced LOW, TopLevelState→SafeWatchdog |
-| WD-002 | Heartbeat write within timeout window | System stays in READY state |
-| WD-003 | Timeout + Interlock failure simultaneously | **Interlock priority** - SafeInterlock reported before SafeWatchdog |
+- If interlock is HIGH, `SYS_STATE` can report `Ready` during the grace window
+- If interlock is LOW, `SYS_STATE` reports `SafeInterlock` even during the grace window
+- After the grace window, lack of keepalive transitions the unit to `SafeWatchdog`
 
-### 4.2 Interlock Testing
+### INIT-004 - LCD Presence and Absence
 
-```cpp
-// Pin: Config::KB_INTERLOCK_PIN = 22
-// Active HIGH with no pullup (Config::INTERLOCK_ACTIVE_HIGH=true, INTERLOCK_USE_PULLUP=false)
-```
+Verify both cases:
 
-| Test Case | Input State | Expected Behavior |
-|-----------|-------------|-------------------|
-| IL-001 | Interlock pin LOW | TopLevelState→SafeInterlock, all outputs forced OFF |
-| IL-002 | Interlock pin HIGH with DC command | Outputs drive per channel configuration (READY state) |
+- LCD attached at `0x27`
+- LCD attached at `0x3F`
+- No LCD attached at all
 
-### 4.3 Combined Safety Tests
+Pass criteria:
 
-```cpp
-// Test: Simulate both watchdog timeout AND interlock failure
-```
-
-Expected priority order in `evaluateTopLevelState()`:
-1. **SafeInterlock** - highest priority
-2. SafeWatchdog
-3. FaultLatched
-4. Ready
+- The firmware continues to run correctly in all three cases
+- No-LCD operation does not block Modbus communications
 
 ---
 
-## 5. Fault Management Tests
+## 2. Register Map and Communication Tests
 
-### 5.1 Overcurrent Detection
+### 2.1 Read Tests
 
-| Test Case | Status Pin State | Expected Behavior |
-|-----------|------------------|-------------------|
-| FC-001 | OVERCURRENT_STATUS_PIN LOW (active) on any channel | Runtime::faultLatched = true immediately in loop() |
-| FC-002 | Clear command (REG_COMMAND=3) with fault active | **Exception 0x04** - cannot clear while fault asserted |
+| Test | Read | Expected Result |
+|------|------|-----------------|
+| REG-001A | `0-33` | Succeeds; includes control registers and current values used by the GUI |
+| REG-001B | `100-105` | Succeeds; returns system state, reason, fault, interlock, watchdog, last error |
+| REG-001C | `110-118` | Succeeds; CH1 live status |
+| REG-001D | `120-128` | Succeeds; CH2 live status |
+| REG-001E | `130-138` | Succeeds; CH3 live status |
+| REG-002 | `110-138` as one contiguous block | Expected to fail because `119` and `129` are unimplemented gaps |
 
-### 5.2 Fault Latch Reset Sequence
+Additional checks:
 
-```cpp
-// Valid reset sequence: remove overcurrent condition → write REG_COMMAND=2 or 3
-```
+- Verify channel status offsets `4-7` return `0`
+- Verify `output_level` at offset `8` follows the actual gate pin level
 
-| Check | Expected |
-|-------|----------|
-| After command accepted | Runtime::faultLatched = false, TopLevelState returns to READY (if no other issues) |
-| Fault status register | Returns 0 after clear |
+### 2.2 Write Tests
 
----
+| Test | Register | Input | Expected Result |
+|------|----------|-------|-----------------|
+| REG-010 | `WATCHDOG_MS` | `50`, `1500`, `60000` | Accepted |
+| REG-011 | `WATCHDOG_MS` | `49`, `60001` | Rejected by callback; value stays unchanged; `LAST_ERROR=3` |
+| REG-012 | `TELEMETRY_MS` | `0`, `1`, `1500`, `65535` | Accepted |
+| REG-013 | `CHx_PULSE_MS` | `1`, `100`, `60000` | Accepted |
+| REG-014 | `CHx_PULSE_MS` | `0`, `60001` | Rejected; `LAST_ERROR=3` |
+| REG-015 | `CHx_COUNT` | `1`, `2`, `10000` | Accepted |
+| REG-016 | `CHx_COUNT` | `0`, `10001` | Rejected; `LAST_ERROR=3` |
 
-## 6. LCD Display Tests
+### 2.3 Error Register Behavior
 
-### 6.1 LCD During Modbus Activity
+#### REG-003 - `LAST_ERROR` Auto-Clears
 
-**CRITICAL: This is a race-condition sensitive area - verify thoroughly**
+Procedure:
 
-Current strategy: LCD refreshes in the inter-poll quiet window (~250 ms gap between
-dashboard polls). A refresh is skipped — and deferred 50 ms — if any Modbus byte
-arrived in the last 50 ms (`framePending`). TWI is disabled (`TWCR = 0`) between
-refreshes to prevent electrical noise from corrupting the PCF8574 output register.
-I2C clock runs at 400 kHz, keeping the full 4-row refresh to ~20 ms.
+1. Force a known error, for example write `WATCHDOG_MS=49`
+2. Read register `105` once
+3. Read register `105` again
 
-| Test Case | Verify |
-|-----------|--------|
-| LC-001 | LCD **does update** ~once per second even while host is connected (quiet-window refresh) |
-| LC-002 | TWI peripheral disabled (`TWCR = 0`) between refreshes and re-enabled only for the ~20 ms render window |
-| LC-003 | No LCD update occurs within 50 ms of the last Modbus byte (defer path fires, retries in 50 ms) |
-| LC-004 | First frame after boot (before any valid command): `framePending` alone blocks I2C — no race with first incoming frame |
+Verify:
 
-### 6.2 LCD Content Verification
+- First read returns `3`
+- Second read returns `0`
 
-During idle (no Modbus activity):
+Note:
 
-```
-Row 0: "WDG:OK INT:OK FLT:0" or similar status summary
-Row 1-3: Per-channel info - e.g., "CH1 DC O:1 R:0"
-```
-
-| Check | Expected Format |
-|-------|-----------------|
-| Mode abbreviations | OFF, DC , PUL, TRN (modeToShortString) |
-| Output level | O:1 when HIGH, O:0 when LOW |
-| Pulse remaining | R:<count> for pulse/pulse-train modes |
+- Any host that polls `105` continuously must surface the value immediately because the read clears it.
 
 ---
 
-## 7. Edge Cases & Stress Tests
+## 3. Command Register Tests
 
-### 7.1 Buffer Overflow Protection
+### CMD-001 - `COMMAND=0` NOP
 
-```cpp
-// Modbus receive buffer is MODBUS_RX_BUFFER_SIZE = 256 bytes
-```
+Verify:
 
-| Test Case | Setup | Verify |
-|-----------|-------|--------|
-| EO-001 | Send frame larger than 254 bytes (before CRC) | Runtime::modbusRxIndex resets, error set to BufferOverflow |
+- No mode changes occur
+- No outputs change state
+- Command register reads back `0`
+- Watchdog is fed by the write callback
 
-### 7.2 Frame Timing Tests
+### CMD-002 - `COMMAND=1` AllOff
 
-```cpp
-// MODBUS_FRAME_GAP_MS = 4ms - inter-frame silence required for new frame detection
-```
+Setup:
 
-| Test Case | Expected Behavior |
-|-----------|-------------------|
-| EO-002 | Rapid consecutive frames <4ms apart | Second frame appended to same buffer (single frame) |
-| EO-003 | Valid frame followed immediately by garbage | First frame processed, garbage accumulates in next receive cycle |
+- Start one or more channels in `DC`, `Pulse`, or `PulseTrain`
 
-### 7.3 CRC Error Handling
+Verify:
 
-```cpp
-// ModbusCrc16 uses standard polynomial 0xA001 (reflected)
-```
+- All gate outputs go LOW immediately
+- All three `CH_MODE` control registers are forced to `0`
+- Live status mode also returns `OFF`
 
-| Test Case | Expected Behavior |
-|-----------|-------------------|
-| EO-004 | Frame with incorrect CRC | **Silently discarded** - no exception sent, frame ignored |
-| EO-005 | Valid CRC but bad data in payload | Processed normally (CRC protects integrity only) |
+### CMD-003 - `COMMAND=2` and `COMMAND=3` ClearFault
 
-### 7.4 Timer Overflow Tests
+Verify current behavior:
 
-```cpp
-// uint32_t for countdowns → overflows after ~49 days at 1ms ticks
-```
+- Both values behave the same in the current source
+- With interlock LOW, the command is rejected and `LAST_ERROR=12`
+- With interlock HIGH, the command is accepted and clears `g_faultLatched` if it had been set
 
-| Test Case | Verify |
-|-----------|--------|
-| EO-006 | Long-duration pulse trains (>49 days) | Countdown wraps correctly due to unsigned arithmetic |
+Important note:
+
+- The current firmware does not expose a true arm/disarm command. Do not treat `COMMAND=3` as arm.
 
 ---
 
-## 8. Additional Considerations
+## 4. Channel Output and Timing Tests
 
-### 8.1 Configuration Testing
+Use an oscilloscope for all pulse timing checks.
 
-Verify each compile-time constant works as intended:
+### CH-001 - DC Mode
 
-```cpp
-// Toggle these defines and verify behavior changes:
-#define BCON_MODBUS_USE_USB_SERIAL   // Serial vs Serial1 port selection
-#define BCON_ENABLE_I2C_LCD          // LCD subsystem enabled/disabled
-```
+Procedure:
 
-### 8.2 Power Cycle Tests
+1. Set interlock HIGH
+2. Keep watchdog alive
+3. Write `CH_MODE=1`
 
-| Test Case | Verify |
-|-----------|--------|
-| PC-001 | Cold boot - all outputs start LOW, watchdog grace active |
-| PC-002 | WDT reset scenario (stall loop >8s) - MCUSR captures cause |
-| PC-003 | Partial power cycle (LCD disconnected mid-operation) - graceful degradation |
+Verify:
 
-### 8.3 Pin Consistency Verification
+- Gate output goes HIGH and stays HIGH
+- LED output mirrors the gate output
+- Channel status mode returns `DC`
+- `remaining` stays `0`
 
-Create a pin mapping spreadsheet to verify all Config pins match hardware schematics:
+### CH-002 - Single Pulse
 
-```
-Channel Control:     Gate(5,6,7), EnableToggle(8,9,10)
-Status Inputs:       Enable(23,27,31), Power(24,28,32), OC(25,29,33), Gated(26,30,34)
-Interlock:           KB_INTERLOCK_PIN = 22
-RS485 DE/RE:         RS485_DE_RE_PIN = 2
-LCD I2C:             SDA(20), SCL(21) - used in bit-bang recovery only
-```
+Procedure:
+
+1. Write `PULSE_MS=500`
+2. Write `COUNT=1`
+3. Write `MODE=2`
+
+Verify:
+
+- Gate goes HIGH immediately
+- Gate returns LOW after about `500 ms`
+- `remaining` transitions to `0`
+- Mode returns to `OFF` after the pulse completes
+
+### CH-003 - Pulse Auto-Promotion
+
+Procedure:
+
+1. Write `PULSE_MS=200`
+2. Write `COUNT=5`
+3. Write `MODE=2` (`Pulse`)
+
+Verify:
+
+- The firmware stores the effective mode as `PulseTrain`
+- The output pattern is `HIGH 200 ms` then `LOW 200 ms`, repeated five times total
+- The channel returns to `OFF` at the end
+
+### CH-004 - Explicit PulseTrain
+
+Procedure:
+
+1. Write `MODE=3`
+2. Test with `COUNT=5`
+
+Verify:
+
+- Behavior matches the pulse-train timing above
+
+Characterization check:
+
+- Also test `MODE=3` with `COUNT=1` and document the observed result for regression tracking
+
+### CH-005 - Enable Toggle Output
+
+Procedure:
+
+1. Write `CH_ENA_TOGGLE=1`
+
+Verify:
+
+- Corresponding enable-toggle output goes HIGH for about `100 ms`
+- Output then returns LOW automatically
+- This path works even when the top-level state is not `Ready`
+
+### CH-006 - Status Register Mapping
+
+Verify:
+
+- Offset `0`: active mode
+- Offset `1`: configured pulse duration
+- Offset `2`: configured count
+- Offset `3`: pulses remaining in current run
+- Offsets `4-7`: always `0`
+- Offset `8`: gate output level
 
 ---
 
-## Test Execution Priority Matrix
+## 5. Safety and State-Machine Tests
 
-| Phase | Tests | Duration Estimate | Pass Criteria |
-|-------|-------|-------------------|---------------|
-| P0 - Safety Critical | INIT-*, WD-*, IL-*, FC-* | 2 hours | All outputs OFF when fault conditions detected |
-| P1 - Core Functionality | RC-*, WC-*, Output Control tests | 4 hours | All basic operations work correctly |
-| P2 - Communication | Modbus function code tests, error handling | 3 hours | Protocol compliance verified |
-| P3 - Edge Cases | Buffer overflow, CRC errors, timing | 1 hour | Graceful degradation, no crashes |
-| P4 - LCD/Diagnostics | Display content, activity detection | 1 hour | Accurate status reporting |
+### SAFE-001 - Interlock Safe State
+
+Procedure:
+
+1. Start a channel in `DC`
+2. Pull interlock LOW
+
+Verify:
+
+- `SYS_STATE` becomes `SafeInterlock`
+- All gate outputs are forced LOW
+- LED outputs are forced LOW
+
+### SAFE-002 - Watchdog Expiry
+
+Procedure:
+
+1. Keep interlock HIGH
+2. Stop all writes and stop reading register `100`
+3. Wait longer than the watchdog timeout after the grace window
+
+Verify:
+
+- `SYS_STATE` becomes `SafeWatchdog`
+- All gate outputs are forced LOW
+
+### SAFE-003 - Keepalive Path
+
+Verify both paths:
+
+- Reading `SYS_STATE` (`100`) keeps the watchdog alive
+- Writing any register with a callback also keeps the watchdog alive
+
+Important note:
+
+- Do not assume that reading arbitrary holding registers feeds the watchdog. The explicit read keepalive path is `SYS_STATE`.
+
+### SAFE-004 - State Priority
+
+Confirm priority order in `evaluateState()`:
+
+1. `SafeInterlock`
+2. `SafeWatchdog`
+3. `FaultLatched`
+4. `Ready`
+
+### SAFE-005 - Non-Ready Mode Write Rejection
+
+Procedure:
+
+1. Make the controller non-ready by opening the interlock or letting the watchdog expire
+2. Attempt to write `MODE=1`, `2`, or `3`
+
+Verify:
+
+- The mode write is rejected
+- `LAST_ERROR=10`
+- The existing channel mode remains unchanged
+
+### SAFE-006 - Recovery Behavior
+
+Verify current behavior after returning to `Ready`:
+
+- DC channels resume HIGH because the mode remains `DC`
+- Pulse and pulse-train channels should be characterized and documented because their timing state is not explicitly paused during non-ready intervals
 
 ---
 
-## Recommended Test Equipment
+## 6. Fault-Handling Tests
 
-1. **Oscilloscope** (essential) - Verify pulse widths and timing accuracy
-2. **Multimeter** - Verify DC mode voltage levels
-3. **Logic analyzer** - Optional, for I2C bus monitoring during LCD tests
-4. **Modbus master tool** - Python script or commercial tool for automated testing
+### FLT-001 - Current Bench Limitation
+
+Current source limitation:
+
+- `g_faultLatched` is present in the state machine, but there is no hardware input path in the current firmware that asserts it during normal bench use
+
+Pass criteria for current bench build:
+
+- `FAULT_LATCHED` stays `0` unless an instrumented test build is used
+
+### FLT-002 - ClearFault with Interlock LOW
+
+Procedure:
+
+1. Force interlock LOW
+2. Write `COMMAND=3`
+
+Verify:
+
+- `LAST_ERROR=12`
+- No unsafe state transition occurs
+
+### FLT-003 - ClearFault with Interlock HIGH
+
+Procedure:
+
+1. Force interlock HIGH
+2. Write `COMMAND=3`
+
+Verify:
+
+- Command is accepted
+- If no fault is latched, the operation is effectively a no-op
+
+### FLT-004 - Instrumented Fault-Latch Test
+
+Optional debug-build test:
+
+- Add a temporary test hook that sets `g_faultLatched = true`
+- Verify `SYS_STATE=FaultLatched`
+- Verify `COMMAND=3` clears the latched fault when interlock is HIGH
 
 ---
 
-## Notes on Firmware Design Issues Found During Review
+## 7. LCD Tests
 
-1. **LCD/TWI Quiet-Window Refresh**: TWI is disabled between refreshes to block noise from USB serial traffic. The LCD updates ~once per second in the inter-poll gap, so the display stays live while the host is connected. Any refresh attempt within 50 ms of a Modbus byte is deferred; the gate keys off `framePending` (recent serial activity) alone — not on whether a full valid frame has completed — to close the first-frame race at boot or after >5 s idle.
+### LCD-001 - Address Detect and Graceful Absence
 
-2. **Silent CRC Errors**: Invalid CRC frames are silently discarded without logging or status update. May make debugging communication issues harder.
+Verify:
 
-3. **Watchdog Grace Period**: 8-second grace window may be too long for some applications - consider making it configurable.
+- LCD is found at `0x27` when present
+- LCD falls back to `0x3F` when that is the only valid address
+- If neither address responds, the firmware continues running without LCD updates
 
-4. **Unsupported Function Codes**: Only FC 0x03, 0x06, and 0x10 are implemented. Any other function code (e.g., FC 0x01, 0x02) returns Modbus exception 0x01 (Illegal Function) — not silently ignored.
+### LCD-002 - Quiet-Window Refresh
 
-5. **Regression tests added for callback recursion and callback disabling**:
-    - Verify `Reg::WATCHDOG_MS` and `Reg::TELEMETRY_MS` registers are at addresses 0 and 1, not the timeout default values.
-    - Verify `cbSetCHxMode` does not call `mb.Hreg(Reg::CH_MODE(...), ...)` during ON_SET callback; the answer is returned via callback return value.
-    - Verify `handleModeWrite` uses live `evaluateState()` and rejects non-Ready mode writes correctly (fault safe behavior) without entering recursion.
-    - Verify `cbSetCommand` with value 1 (AllOff) disables callbacks during channel register writes and does not trigger `cbSetCHxMode` recursively.
-    - Verify `tickChannel` state-transition mode write uses cbDisable/cbEnable around direct register set to avoid reentrancy.
+Verify:
 
-6. **Read/Write Watchdog expectation**:
-    - `cbGetSysState` should feed the watchdog on each read. Test that polling FC03 on 100 works as heartbeat.
-    - GUI heartbeat write path: every third poll triggers `REG_COMMAND=0` NOP, enabling recovery if read path is briefly interrupted.
+- LCD refresh is deferred if a serial byte arrived in the last `50 ms`
+- LCD refresh cadence is about `1 s`
+- TWI remains enabled after setup; LCD updates do not toggle `TWCR` or re-run `Wire.begin()` per row
 
-7. **README consistency checks:**
-    - Confirm README statement “any valid Modbus frame counts as keepalive” is true: read (FC03) and write (FC06/0x10 + callback path) update `g_wdLastFeedMs`.
-    - Confirm handshake fallback and safe-state behavior are described (SafeWatchdog/SafeInterlock/FaultLatched).
+### LCD-003 - Content Format
+
+Expected pattern:
+
+- Row 0: watchdog, interlock, fault summary
+- Rows 1-3: `CHn`, mode abbreviation, output level, remaining count
+
+Verify abbreviations:
+
+- `OFF`
+- `DC `
+- `PUL`
+- `TRN`
+
+---
+
+## 8. GUI Interoperability Smoke Tests
+
+These are bench tests for the updated GUI in `test_interfaces/pulser_test_gui.py`.
+
+### GUI-001 - Connect and Poll
+
+Verify:
+
+- GUI connects at `115200`, unit ID `1`
+- GUI waits through the Mega reset window after opening the port
+- GUI can read `0-33`, `100-105`, and the three 9-register channel status blocks
+
+### GUI-002 - Clear Fault Button
+
+Verify:
+
+- The GUI sends `COMMAND=3`
+- The GUI no longer presents an arm/disarm workflow that the firmware does not support
+
+### GUI-003 - Stop Paths
+
+Verify:
+
+- Sync Stop uses `COMMAND=1`
+- Stopping a running CSV sequence forces `AllOff`
+
+### GUI-004 - Error Visibility
+
+Verify:
+
+- Trigger `LAST_ERROR=3` or `12`
+- Confirm the GUI surfaces it immediately before the register is cleared by the read
+
+---
+
+## 9. Configuration Matrix
+
+Run at least one smoke test for each supported compile-time mode:
+
+| Config | Expected Result |
+|--------|-----------------|
+| `BCON_USE_USB_SERIAL=1`, `BCON_ENABLE_LCD=1` | Current bench baseline |
+| `BCON_USE_USB_SERIAL=1`, `BCON_ENABLE_LCD=0` | No LCD, Modbus still works |
+| `BCON_USE_USB_SERIAL=0`, `BCON_ENABLE_LCD=1` | RS-485 transport works with DE/RE pin `17` |
+
+---
+
+## 10. Removed or Not-Applicable Legacy Tests
+
+The following items from the old plan do not match the current firmware and should not be used as acceptance criteria:
+
+- Bit-bang I2C bus recovery before LCD init
+- Custom Modbus RX buffer overflow and CRC parser tests owned by in-repo protocol code
+- Bench tests for enable-status, power-status, overcurrent-status, and gated-status input pins
+- Any remote-arm or arm-beam register workflow
+- Assumptions that reading every holding register range is legal; the current register map has real gaps
+
+---
+
+## Execution Priority
+
+| Phase | Focus | Pass Criteria |
+|-------|-------|---------------|
+| P0 | Interlock, watchdog, AllOff, non-ready rejection | Outputs always fail safe |
+| P1 | Register map, read/write validation, `LAST_ERROR` behavior | Host contract matches source |
+| P2 | DC, pulse, pulse-train, enable-toggle timing | Measured outputs match configured timing |
+| P3 | LCD and GUI interoperability | Diagnostics stay accurate under live polling |
+| P4 | Optional instrumented fault-latch tests and RS-485 build | Extended coverage complete |

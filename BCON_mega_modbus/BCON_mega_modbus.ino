@@ -606,16 +606,12 @@ static void lcdUpdate() {
                  (unsigned int)(c.pulsesLeft & 0xFFFFu));
     }
 
-    // Write only changed rows; disable TWI between writes to reduce I2C noise
+    // Write only changed rows; keep TWI enabled between refreshes.
     for (uint8_t r = 0; r < Cfg::LCD_ROWS; r++) {
         if (memcmp(g_lcdBuf[r], g_lcdLast[r], Cfg::LCD_COLS) != 0) {
-            TWCR = 0;           // disable TWI hardware
-            Wire.begin();
-            Wire.setClock(400000);
             g_lcd->setCursor(0, r);
             g_lcd->print(g_lcdBuf[r]);
             memcpy(g_lcdLast[r], g_lcdBuf[r], Cfg::LCD_COLS + 1);
-            TWCR = 0;           // disable again until next write
         }
     }
 }
