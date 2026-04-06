@@ -1,24 +1,23 @@
 """
-Pulser Upper‑Machine GUI (Tkinter + Material-style with CustomTkinter)
+Pulser Upper-Machine GUI (Tkinter + CustomTkinter)
 - Modbus RTU master using pymodbus
-- Auto-scans serial ports (Linux) by default
-- Features implemented (first version):
-  - Manual per-channel control (start/stop/single + parameter write)
-  - Synchronous start/stop via `SYNC_CMD` (mask + action)
-  - Safety / Remote-ARM register and physical enable input monitoring
-  - Register viewer/editor (read/write holding registers)
-  - Presets save/load (JSON)
-  - CSV session logging (events)
+- Auto-scans serial ports
+- Features implemented:
+    - Manual per-channel control (parameter write + mode control)
+    - Synchronous multi-channel start/stop
+    - Safety, interlock, and fault monitoring aligned with firmware
+    - Register viewer/editor (read/write holding registers)
+    - Presets save/load (JSON)
+    - CSV session logging (events)
 
 Usage:
-  1) pip install -r requirements.txt
-  2) python3 pulser_gui.py
+    1) pip install -r requirements.txt
+    2) python pulser_test_gui.py
 
-Author: generated (GitHub Copilot — Raptor mini (Preview))
+Author: generated (GitHub Copilot)
 """
 
 import os
-import sys
 import json
 import csv
 import time
@@ -82,6 +81,33 @@ MODE_LABEL_TO_CODE = {
     "DC": MODE_DC,
     "PULSE": MODE_PULSE,
     "PULSE_TRAIN": MODE_PULSE_TRAIN,
+}
+
+COMMAND_NOP = 0
+COMMAND_ALL_OFF = 1
+COMMAND_CLEAR_FAULT = 3
+
+WATCHDOG_MIN_MS = 50
+WATCHDOG_MAX_MS = 60000
+TELEMETRY_MIN_MS = 0
+TELEMETRY_MAX_MS = 65535
+PULSE_MS_MIN = 1
+PULSE_MS_MAX = 60000
+COUNT_MIN = 1
+COUNT_MAX = 10000
+
+SYS_STATE_LABELS = {
+    0: "Ready",
+    1: "SafeInterlock",
+    2: "SafeWatchdog",
+    3: "FaultLatched",
+}
+
+LAST_ERROR_LABELS = {
+    0: "None",
+    3: "Invalid parameter",
+    10: "Command rejected while controller is not ready",
+    12: "Clear fault rejected because interlock is open",
 }
 
 # Default Modbus/settings
@@ -316,6 +342,8 @@ class PulserApp(ctk.CTk):
         self._seq_steps: list = []          # parsed [(step_num, rows, dwell_ms), ...]
         self._seq_thread: threading.Thread | None = None
         self._seq_stop = threading.Event()
+        self._last_device_error = 0
+        self._last_device_error_text = LAST_ERROR_LABELS[0]
 
         self._build_ui()
         self.after(200, self._periodic)
@@ -508,14 +536,27 @@ class PulserApp(ctk.CTk):
             command=self._stop_sequence, state="disabled")
         self.seq_stop_btn.pack(side="left", padx=4)
 
-        # Safety / Remote arm
+        # Safety / fault state
         safety_frame = ctk.CTkFrame(left)
         safety_frame.pack(fill="x", pady=8, padx=6)
-        ctk.CTkLabel(safety_frame, text="Safety & Remote Arm", font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, sticky="w", pady=(6,8))
-        self.safety_label = ctk.CTkLabel(safety_frame, text="Interlock: unknown")
-        self.safety_label.grid(row=1, column=0, sticky="w")
-        self.remote_arm_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(safety_frame, text="REMOTE_ARM", variable=self.remote_arm_var, command=self._toggle_remote_arm).grid(row=1, column=1, padx=12)
+        ctk.CTkLabel(safety_frame, text="Safety & Faults", font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(6,8))
+        self.safety_label = ctk.CTkLabel(safety_frame, text="System: unknown", anchor="w")
+        self.safety_label.grid(row=1, column=0, columnspan=2, sticky="w")
+        self.reason_label = ctk.CTkLabel(safety_frame, text="Reason: unknown", anchor="w")
+        self.reason_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4,0))
+        self.fault_label = ctk.CTkLabel(safety_frame, text="Fault latch: unknown", anchor="w")
+        self.fault_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(4,0))
+        self.error_label = ctk.CTkLabel(safety_frame, text="Last controller error: None", anchor="w", text_color="gray")
+        self.error_label.grid(row=4, column=0, columnspan=3, sticky="w", pady=(4,0))
+        self.clear_fault_btn = ctk.CTkButton(
+            safety_frame,
+            text="Clear Fault",
+            fg_color="#f39c12",
+            hover_color="#d68910",
+            command=self._clear_fault,
+            state="disabled",
+        )
+        self.clear_fault_btn.grid(row=1, column=2, rowspan=2, padx=8, sticky='e')
 
         # System settings (watchdog / telemetry)
         sys_frame = ctk.CTkFrame(left)
@@ -529,12 +570,6 @@ class PulserApp(ctk.CTk):
         self.telemetry_entry = ctk.CTkEntry(sys_frame, width=80)
         self.telemetry_entry.grid(row=2, column=1, padx=4, sticky="w", pady=(4,0))
         ctk.CTkButton(sys_frame, text="Set", width=60, command=self._set_telemetry).grid(row=2, column=2, padx=4, pady=(4,0))
-
-        # Arm Beam control (requires explicit confirmation)
-        self.arm_btn = ctk.CTkButton(safety_frame, text="Arm Beam", fg_color="#2ecc71", command=self._arm_beam)
-        self.arm_btn.grid(row=1, column=2, padx=8, sticky='e')
-        self.arm_status_lbl = ctk.CTkLabel(safety_frame, text="DISARMED", text_color="gray")
-        self.arm_status_lbl.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8,0))
 
         # Presets & Logging
         ctrl_frame = ctk.CTkFrame(left)
@@ -614,31 +649,73 @@ class PulserApp(ctk.CTk):
         except Exception as e:
             self._log_event(f"Theme change failed: {e}")
 
+    def _parse_required_int(self, raw_value, field_name):
+        value = raw_value.strip()
+        if not value:
+            raise ValueError(f"{field_name} is required")
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be an integer") from exc
+
+    def _parse_optional_int(self, raw_value, field_name):
+        value = raw_value.strip()
+        if not value:
+            return None
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be an integer") from exc
+
+    def _validate_range(self, value, field_name, minimum, maximum):
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{field_name} must be between {minimum} and {maximum}")
+
+    def _resolve_mode(self, mode_label, count=None):
+        normalized = mode_label.strip().upper()
+        if normalized not in MODE_LABEL_TO_CODE:
+            raise ValueError(f"Unsupported mode: {normalized}")
+        if normalized == "PULSE" and count is not None and count > 1:
+            normalized = "PULSE_TRAIN"
+        return normalized, MODE_LABEL_TO_CODE[normalized]
+
+    def _format_state(self, code):
+        return SYS_STATE_LABELS.get(code, f"Unknown ({code})")
+
+    def _format_error(self, code):
+        return LAST_ERROR_LABELS.get(code, f"Unknown controller error ({code})")
+
+    def _queue_command(self, command, description):
+        self.modbus.enqueue_write(REG_COMMAND, command)
+        self._log_event(description)
+
+    def _clear_fault(self):
+        if not self.modbus.connected:
+            messagebox.showwarning("Clear Fault", "Not connected to device.")
+            return
+        if not messagebox.askyesno(
+            "Clear Fault",
+            "Send clear-fault command to the controller?\n\nInterlock must be asserted.",
+        ):
+            return
+        self._queue_command(COMMAND_CLEAR_FAULT, "Sent clear-fault command")
+
     def _apply_channel(self, ch, d_entry, cnt_entry, mode_cb):
         try:
-            duration = int(d_entry.get())
-            count = int(cnt_entry.get())
-        except Exception:
-            messagebox.showerror("Invalid", "Enter numeric values for parameters")
-            return
-
-        if duration <= 0:
-            messagebox.showerror("Invalid", "Pulse duration must be > 0")
-            return
-        if count <= 0:
-            messagebox.showerror("Invalid", "Count must be > 0")
-            return
-
-        mode_label = mode_cb.get().strip().upper()
-        if mode_label not in MODE_LABEL_TO_CODE:
-            messagebox.showerror("Invalid", f"Unsupported mode: {mode_label}")
+            duration = self._parse_required_int(d_entry.get(), "Pulse duration")
+            count = self._parse_required_int(cnt_entry.get(), "Count")
+            self._validate_range(duration, "Pulse duration", PULSE_MS_MIN, PULSE_MS_MAX)
+            self._validate_range(count, "Count", COUNT_MIN, COUNT_MAX)
+            mode_label, mode_code = self._resolve_mode(mode_cb.get(), count)
+        except ValueError as exc:
+            messagebox.showerror("Invalid", str(exc))
             return
 
         base = CH_BASE[ch]
         self.modbus.enqueue_write(base + CH_PULSE_MS_OFF, duration)
         self.modbus.enqueue_write(base + CH_COUNT_OFF, count)
-        mode_code = MODE_LABEL_TO_CODE[mode_label]
         self.modbus.enqueue_write(base + CH_MODE_OFF, mode_code)
+        self.channel_vars[ch]['mode'].set(mode_label)
         self._log_event(f"Applied CH{ch+1}: mode={mode_label} duration_ms={duration} count={count}")
 
     def _set_mode(self, ch, mode):
@@ -670,15 +747,19 @@ class PulserApp(ctk.CTk):
             dur_str = cfg['duration'].get().strip()
             cnt_str = cfg['count'].get().strip()
             try:
-                dur = int(dur_str) if dur_str else None
-                cnt = int(cnt_str) if cnt_str else None
-            except ValueError:
-                messagebox.showerror("Invalid", f"CH{ch+1}: duration and count must be integers")
+                dur = self._parse_optional_int(dur_str, f"CH{ch+1} duration")
+                cnt = self._parse_optional_int(cnt_str, f"CH{ch+1} count")
+                if dur is not None:
+                    self._validate_range(dur, f"CH{ch+1} duration", PULSE_MS_MIN, PULSE_MS_MAX)
+                if cnt is not None:
+                    self._validate_range(cnt, f"CH{ch+1} count", COUNT_MIN, COUNT_MAX)
+            except ValueError as exc:
+                messagebox.showerror("Invalid", str(exc))
                 return
             base = CH_BASE[ch]
-            if dur is not None and dur > 0:
+            if dur is not None:
                 self.modbus.enqueue_write(base + CH_PULSE_MS_OFF, dur)
-            if cnt is not None and cnt > 0:
+            if cnt is not None:
                 self.modbus.enqueue_write(base + CH_COUNT_OFF, cnt)
         self._log_event(f"Sync wrote params for CH{[c+1 for c in selected]}")
 
@@ -701,21 +782,19 @@ class PulserApp(ctk.CTk):
             cfg = self.sync_configs[ch]
             dur_str = cfg['duration'].get().strip()
             cnt_str = cfg['count'].get().strip()
-            mode_label = cfg['mode'].get().strip().upper()
             try:
-                dur = int(dur_str) if dur_str else 100
-                cnt = int(cnt_str) if cnt_str else 1
-            except ValueError:
-                messagebox.showerror("Invalid", f"CH{ch+1}: duration and count must be integers")
-                return
-            if mode_label not in MODE_LABEL_TO_CODE:
-                messagebox.showerror("Invalid", f"CH{ch+1}: unknown mode '{mode_label}'")
-                return
-            mode_code = MODE_LABEL_TO_CODE[mode_label]
-            if mode_code == MODE_PULSE_TRAIN and cnt < 2:
-                messagebox.showerror("Invalid", f"CH{ch+1}: PULSE_TRAIN requires count \u2265 2")
+                dur = self._parse_optional_int(dur_str, f"CH{ch+1} duration")
+                cnt = self._parse_optional_int(cnt_str, f"CH{ch+1} count")
+                dur = dur if dur is not None else 100
+                cnt = cnt if cnt is not None else 1
+                self._validate_range(dur, f"CH{ch+1} duration", PULSE_MS_MIN, PULSE_MS_MAX)
+                self._validate_range(cnt, f"CH{ch+1} count", COUNT_MIN, COUNT_MAX)
+                mode_label, mode_code = self._resolve_mode(cfg['mode'].get(), cnt)
+            except ValueError as exc:
+                messagebox.showerror("Invalid", str(exc))
                 return
             params[ch] = (dur, cnt, mode_code, mode_label)
+            self.sync_configs[ch]['mode'].set(mode_label)
 
         # Phase 1: write duration + count for all channels (params must be set before mode)
         for ch, (dur, cnt, mode_code, _) in params.items():
@@ -737,9 +816,7 @@ class PulserApp(ctk.CTk):
 
     def _sync_stop_all(self):
         """Force all three channels to OFF immediately."""
-        for ch in range(3):
-            self.modbus.enqueue_write(CH_BASE[ch] + CH_MODE_OFF, MODE_OFF)
-        self._log_event("Sync Stop: all channels \u2192 OFF")
+        self._queue_command(COMMAND_ALL_OFF, "Sync Stop: all channels -> OFF")
 
     # ----------------------------- CSV Sequence player -----------------------------
 
@@ -768,12 +845,14 @@ class PulserApp(ctk.CTk):
                     count    = int(parts[4]) if len(parts) > 4 and parts[4] else 1
                     dwell_ms = int(parts[5]) if len(parts) > 5 and parts[5] else 0
 
-                    if mode not in MODE_LABEL_TO_CODE:
-                        raise ValueError(f"Unknown mode '{mode}' at step {step_num}")
-                    if mode == "PULSE_TRAIN" and count < 2:
-                        raise ValueError(f"Step {step_num}: PULSE_TRAIN requires count >= 2")
+                    mode, _ = self._resolve_mode(mode, count)
+                    if mode in ("PULSE", "PULSE_TRAIN"):
+                        self._validate_range(dur_ms, f"Step {step_num} duration", PULSE_MS_MIN, PULSE_MS_MAX)
+                        self._validate_range(count, f"Step {step_num} count", COUNT_MIN, COUNT_MAX)
 
                     ch_list = list(range(3)) if ch_str == "ALL" else [int(ch_str) - 1]
+                    if any(ch_idx not in range(3) for ch_idx in ch_list):
+                        raise ValueError(f"Step {step_num}: channel must be 1, 2, 3, or ALL")
                     if step_num not in steps_raw:
                         steps_raw[step_num] = {"rows": [], "dwell_ms": 0}
                     for ch_idx in ch_list:
@@ -815,12 +894,12 @@ class PulserApp(ctk.CTk):
             "#   ch          - channel number (1, 2, 3) or ALL\n"
             "#   mode        - OFF | DC | PULSE | PULSE_TRAIN\n"
             "#   duration_ms - pulse width in ms  (PULSE / PULSE_TRAIN only)\n"
-            "#   count       - pulse count        (PULSE_TRAIN must be >= 2)\n"
+            "#   count       - pulse count        (1-10000)\n"
             "#   dwell_ms    - wait AFTER this step before the next one\n"
             "#                 (only the last row per step number is used)\n"
             "# ============================================================\n"
             "step,ch,mode,duration_ms,count,dwell_ms\n"
-            "1,1,PULSE,100,5,0\n"
+            "1,1,PULSE_TRAIN,100,5,0\n"
             "1,2,PULSE,200,1,0\n"
             "1,3,DC,,,500\n"
             "2,1,PULSE_TRAIN,50,10,0\n"
@@ -878,34 +957,23 @@ class PulserApp(ctk.CTk):
             while time.time() < deadline and not self._seq_stop.is_set():
                 time.sleep(0.05)
 
-        final = "Sequence complete" if not self._seq_stop.is_set() else "Sequence stopped"
+        if self._seq_stop.is_set():
+            self.modbus.enqueue_write(REG_COMMAND, COMMAND_ALL_OFF)
+            final = "Sequence stopped; outputs forced OFF"
+        else:
+            final = "Sequence complete"
         self.ui_queue.put(("seq_status", final))
         self.ui_queue.put(("seq_done", None))
-
-    def _toggle_remote_arm(self):
-        self.remote_arm_var.set(False)
-        self._log_event("REMOTE_ARM register is not implemented in current firmware")
-
-    def _arm_beam(self):
-        """User-facing arm/disarm action with confirmation (typesafe)."""
-        currently_armed = bool(self.remote_arm_var.get())
-        if currently_armed:
-            if not messagebox.askyesno("Disarm Beam", "Disarm the beam now?"):
-                return
-            # disarm
-            self.remote_arm_var.set(False)
-            self._toggle_remote_arm()
-            self._log_event("Beam disarmed via GUI")
-            return
 
     def _set_watchdog(self):
         val = self.watchdog_entry.get().strip()
         if not val:
             return
         try:
-            ms = int(val)
-        except Exception:
-            messagebox.showerror("Invalid", "Watchdog value must be integer")
+            ms = self._parse_required_int(val, "Watchdog")
+            self._validate_range(ms, "Watchdog", WATCHDOG_MIN_MS, WATCHDOG_MAX_MS)
+        except ValueError as exc:
+            messagebox.showerror("Invalid", str(exc))
             return
         self.modbus.enqueue_write(REG_WATCHDOG_MS, ms)
         self._log_event(f"Set watchdog timeout to {ms} ms")
@@ -915,27 +983,17 @@ class PulserApp(ctk.CTk):
         if not val:
             return
         try:
-            ms = int(val)
-        except Exception:
-            messagebox.showerror("Invalid", "Telemetry value must be integer")
+            ms = self._parse_required_int(val, "Telemetry")
+            self._validate_range(ms, "Telemetry", TELEMETRY_MIN_MS, TELEMETRY_MAX_MS)
+        except ValueError as exc:
+            messagebox.showerror("Invalid", str(exc))
             return
         self.modbus.enqueue_write(REG_TELEMETRY_MS, ms)
         self._log_event(f"Set telemetry period to {ms} ms")
 
-        # confirm explicit action: require typing 'ARM'
-        answer = simple_input_dialog(self, "Confirm Arm", "Type ARM to confirm:")
-        if not answer or answer.strip().upper() != 'ARM':
-            messagebox.showwarning("Arm cancelled", "Arm operation cancelled (confirmation failed).")
-            return
-
-        self.modbus.enqueue_write(REG_COMMAND, 3)
-        self._log_event("ARM command sent (REG_COMMAND=3)")
-        messagebox.showinfo("Arm command sent", "Sent ARM/CLEAR command to firmware.")
-
     def _read_all_regs(self):
         # trigger a harmless no-op write so the comm path is exercised.
-        self.modbus.enqueue_write(REG_COMMAND, 0)
-        self._log_event("Requested register refresh")
+        self._queue_command(COMMAND_NOP, "Requested register refresh")
 
     def _write_selected_reg(self):
         sel = self.reg_tree.selection()
@@ -957,13 +1015,23 @@ class PulserApp(ctk.CTk):
 
     def _save_preset(self):
         p = {}
-        for ch in range(3):
-            base = CH_BASE[ch]
-            p[f'ch{ch+1}'] = {
-                'pulse_ms': int(self.channel_vars[ch]['duration'].get() or self.channel_vars[ch]['width'].get() or 0),
-                'count': int(self.channel_vars[ch]['count'].get() or 0),
-                'mode': int(self.modbus.last_regs[base + CH_MODE_OFF])
-            }
+        try:
+            for ch in range(3):
+                pulse_ms = self._parse_optional_int(self.channel_vars[ch]['duration'].get(), f"CH{ch+1} pulse duration")
+                count = self._parse_optional_int(self.channel_vars[ch]['count'].get(), f"CH{ch+1} count")
+                if pulse_ms is not None:
+                    self._validate_range(pulse_ms, f"CH{ch+1} pulse duration", PULSE_MS_MIN, PULSE_MS_MAX)
+                if count is not None:
+                    self._validate_range(count, f"CH{ch+1} count", COUNT_MIN, COUNT_MAX)
+                _, mode_code = self._resolve_mode(self.channel_vars[ch]['mode'].get(), count)
+                p[f'ch{ch+1}'] = {
+                    'pulse_ms': pulse_ms or 0,
+                    'count': count or 0,
+                    'mode': mode_code,
+                }
+        except ValueError as exc:
+            messagebox.showerror("Preset", str(exc))
+            return
         fname = filedialog.asksaveasfilename(defaultextension='.json', initialdir='presets', filetypes=[('JSON','*.json')])
         if fname:
             with open(fname, 'w') as f:
@@ -1049,6 +1117,7 @@ class PulserApp(ctk.CTk):
                 self.conn_label.configure(text=f"Connected ({self.modbus.port})", text_color="green")
             else:
                 self.conn_label.configure(text="Disconnected", text_color="red")
+                self.clear_fault_btn.configure(state="disabled")
         elif typ == 'regs':
             regs = msg[1]
             # update register tree
@@ -1089,17 +1158,36 @@ class PulserApp(ctk.CTk):
             interlock_ok = regs[REG_INTERLOCK_OK]
             watchdog_ok = regs[REG_WATCHDOG_OK]
             sys_state = regs[REG_SYS_STATE]
-            self.safety_label.configure(text=f"Interlock: {'ok' if interlock_ok else 'locked'} | Watchdog: {'ok' if watchdog_ok else 'expired'} | State: {sys_state}")
-            self.remote_arm_var.set(False)
+            sys_reason = regs[REG_SYS_REASON]
+            self.safety_label.configure(
+                text=f"System: {self._format_state(sys_state)} | Interlock: {'OK' if interlock_ok else 'OPEN'} | Watchdog: {'OK' if watchdog_ok else 'EXPIRED'}"
+            )
+            self.reason_label.configure(text=f"Reason: {self._format_state(sys_reason)}")
 
             # update watchdog/telemetry entry fields with current values
             self.watchdog_entry.delete(0, 'end'); self.watchdog_entry.insert(0, str(regs[REG_WATCHDOG_MS]))
             self.telemetry_entry.delete(0, 'end'); self.telemetry_entry.insert(0, str(regs[REG_TELEMETRY_MS]))
 
             if regs[REG_FAULT_LATCHED]:
-                self.arm_status_lbl.configure(text="FAULT LATCHED", text_color="#e74c3c")
+                self.fault_label.configure(text="Fault latch: latched", text_color="#e74c3c")
+                self.clear_fault_btn.configure(state="normal")
             else:
-                self.arm_status_lbl.configure(text="NO LATCHED FAULT", text_color="#2ecc71")
+                self.fault_label.configure(text="Fault latch: clear", text_color="#2ecc71")
+                self.clear_fault_btn.configure(state="disabled")
+
+            last_error = regs[REG_LAST_ERROR]
+            if last_error:
+                error_text = self._format_error(last_error)
+                self._last_device_error = last_error
+                self._last_device_error_text = error_text
+                self.error_label.configure(
+                    text=f"Last controller error: {last_error} - {error_text}",
+                    text_color="#e74c3c",
+                )
+                self._log_event(f"Controller error {last_error}: {error_text}")
+            elif self._last_device_error == 0:
+                self.error_label.configure(text="Last controller error: None", text_color="gray")
+
             self.last_poll_lbl.configure(text=f"Last poll: {datetime.now().strftime('%H:%M:%S')}")
         elif typ == 'wrote':
             reg, val = msg[1], msg[2]
