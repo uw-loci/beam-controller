@@ -15,7 +15,7 @@
 //    2  COMMAND          0=NOP, 1=AllOff, 2/3=ClearFault, 4=ApplyStagedModes
 //
 //  Channel control  (base = ch*10, ch=1..3):
-//    base+0  MODE           staged requested mode; write COMMAND=4 to apply
+//    base+0  MODE           staged requested mode (including Off); write COMMAND=4 to apply
 //    base+1  PULSE_MS       pulse duration ms (1-60000)
 //    base+2  COUNT          pulse count (1-10000)
 //    base+3  ENABLE_TOGGLE  write 1 = 100 ms enable-toggle pulse
@@ -355,7 +355,7 @@ static void queueModeRegisterClearUnsafe(uint8_t idx) {
     g_modeRegisterClearMask |= channelMaskBit(idx);
 }
 
-static void stopChannelUnsafe(uint8_t idx, bool clearRequestedMode) {
+static void resetChannelRuntimeUnsafe(uint8_t idx, bool clearRequestedMode) {
     Channel& c = g_ch[idx];
     timerStopUnsafe(idx);
     c.mode             = Mode::Off;
@@ -363,11 +363,15 @@ static void stopChannelUnsafe(uint8_t idx, bool clearRequestedMode) {
     c.phaseDurationUs  = 0;
     c.phaseRemainingUs = 0;
     c.inHighPhase      = false;
-    setGateStateUnsafe(idx, false);
     if (clearRequestedMode) {
         c.requestedMode    = Mode::Off;
         c.modeApplyPending = false;
     }
+}
+
+static void stopChannelUnsafe(uint8_t idx, bool clearRequestedMode) {
+    resetChannelRuntimeUnsafe(idx, clearRequestedMode);
+    setGateStateUnsafe(idx, false);
 }
 
 static void stopChannel(uint8_t idx, bool clearRequestedMode = true) {
@@ -484,12 +488,15 @@ ISR(TIMER5_COMPA_vect) {
 
 static bool applyPendingModes() {
     uint8_t applyMask = 0;
+    bool hasNonOffRequest = false;
     for (uint8_t idx = 0; idx < 3; idx++) {
-        if (g_ch[idx].modeApplyPending) applyMask |= channelMaskBit(idx);
+        if (!g_ch[idx].modeApplyPending) continue;
+        applyMask |= channelMaskBit(idx);
+        if (g_ch[idx].requestedMode != Mode::Off) hasNonOffRequest = true;
     }
     if (applyMask == 0) return true;
 
-    if (evaluateState() != TopState::Ready) {
+    if (hasNonOffRequest && evaluateState() != TopState::Ready) {
         g_lastError = 10;
         mb.Hreg(Reg::LAST_ERROR, g_lastError);
         return false;
@@ -502,7 +509,7 @@ static bool applyPendingModes() {
         for (uint8_t idx = 0; idx < 3; idx++) {
             if ((applyMask & channelMaskBit(idx)) == 0) continue;
             gateLowMask |= channelMaskBit(idx);
-            stopChannelUnsafe(idx, false);
+            resetChannelRuntimeUnsafe(idx, false);
         }
 
         for (uint8_t idx = 0; idx < 3; idx++) {
@@ -612,8 +619,7 @@ static void handleModeWrite(uint8_t idx, uint16_t val) {
 
     if (newMode == Mode::Off) {
         g_ch[idx].requestedMode = Mode::Off;
-        g_ch[idx].modeApplyPending = false;
-        stopChannel(idx, true);
+        g_ch[idx].modeApplyPending = true;
         return;
     }
 

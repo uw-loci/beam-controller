@@ -68,7 +68,7 @@
 | WC-002 | REG_TELEMETRY_MS | Any valid uint16 | Accepts, updates Runtime::telemetryPeriodMs |
 | WC-003 | REG_COMMAND=1 | Value=1 | All channels OFF immediately |
 | WC-004 | REG_COMMAND=2/3 with fault active | Fault still asserted | **Returns exception 0x04** (FaultStillActive) - prevents unsafe clearing |
-| WC-005 | REG_COMMAND=4 | Pending staged CHx mode writes | Commits all staged non-OFF channel starts together |
+| WC-005 | REG_COMMAND=4 | Pending staged CHx mode writes | Commits all staged channel start/stop requests together |
 
 ### 2.3 Write Multiple Registers (Function Code 0x10)
 
@@ -138,6 +138,19 @@
 |-------|----------|
 | When watchdog expires | **All outputs forced LOW** (applyOutputs() checks TopLevelState) |
 | After watchdog restored via heartbeat | Outputs resume per current channel commands |
+
+### 3.5 Sync Stop Tests
+
+```cpp
+// Test: with CH1 and CH3 actively pulsing, stage CH1_MODE=0 and CH3_MODE=0,
+// then write REG_COMMAND=4 and verify both outputs fall together.
+```
+
+| Check | Expected |
+|-------|----------|
+| Selected channels | Requested channels stop on the same apply boundary |
+| Unselected channels | Continue running unaffected |
+| COMMAND=1 | Still forces all channels OFF immediately |
 
 ---
 

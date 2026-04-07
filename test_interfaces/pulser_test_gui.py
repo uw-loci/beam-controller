@@ -473,8 +473,10 @@ class PulserApp(ctk.CTk):
                       command=self._sync_write_params).pack(side="left", padx=4)
         ctk.CTkButton(btn_row, text="▶ Start Selected", width=120, fg_color="#2ecc71",
                       hover_color="#27ae60", command=self._sync_start).pack(side="left", padx=4)
-        ctk.CTkButton(btn_row, text="⏹ Stop All", width=100, fg_color="#e74c3c",
-                      hover_color="#c0392b", command=self._sync_stop_all).pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="⏹ Stop Selected", width=120, fg_color="#e67e22",
+                  hover_color="#ca6f1e", command=self._sync_stop_selected).pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="All Off", width=90, fg_color="#e74c3c",
+                  hover_color="#c0392b", command=self._sync_stop_all).pack(side="left", padx=4)
 
         # CSV Pulse Sequence player
         seq_frame = ctk.CTkFrame(left)
@@ -640,8 +642,7 @@ class PulserApp(ctk.CTk):
         self.modbus.enqueue_write(base + CH_COUNT_OFF, count)
         mode_code = MODE_LABEL_TO_CODE[mode_label]
         self.modbus.enqueue_write(base + CH_MODE_OFF, mode_code)
-        if mode_code != MODE_OFF:
-            self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
+        self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
         self._log_event(f"Applied CH{ch+1}: mode={mode_label} duration_ms={duration} count={count}")
 
     def _set_mode(self, ch, mode):
@@ -649,8 +650,7 @@ class PulserApp(ctk.CTk):
         if mode == MODE_PULSE:
             self.modbus.enqueue_write(base + CH_COUNT_OFF, 1)
         self.modbus.enqueue_write(base + CH_MODE_OFF, mode)
-        if mode != MODE_OFF:
-            self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
+        self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
         mode_name = {
             MODE_OFF: "OFF",
             MODE_DC: "DC",
@@ -733,9 +733,8 @@ class PulserApp(ctk.CTk):
         for ch, (_, _, mode_code, _) in params.items():
             self.modbus.enqueue_write(CH_BASE[ch] + CH_MODE_OFF, mode_code)
 
-        # Phase 3: commit all staged non-OFF modes together in firmware
-        if any(params[ch][2] != MODE_OFF for ch in selected):
-            self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
+        # Phase 3: commit all staged mode changes together in firmware
+        self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
 
         self._log_event(
             "Sync Start: " +
@@ -745,11 +744,21 @@ class PulserApp(ctk.CTk):
             )
         )
 
-    def _sync_stop_all(self):
-        """Force all three channels to OFF immediately."""
-        for ch in range(3):
+    def _sync_stop_selected(self):
+        """Stage OFF for checked channels, then apply them together."""
+        selected = [ch for ch in range(3) if self.sync_ch_vars[ch].get()]
+        if not selected:
+            self._log_event("Sync Stop: no channels checked")
+            return
+        for ch in selected:
             self.modbus.enqueue_write(CH_BASE[ch] + CH_MODE_OFF, MODE_OFF)
-        self._log_event("Sync Stop: all channels \u2192 OFF")
+        self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
+        self._log_event(f"Sync Stop: CH{[c+1 for c in selected]} \u2192 OFF")
+
+    def _sync_stop_all(self):
+        """Immediate all-off command for emergency stop behavior."""
+        self.modbus.enqueue_write(REG_COMMAND, 1)
+        self._log_event("All Off: COMMAND=1")
 
     # ----------------------------- CSV Sequence player -----------------------------
 
@@ -882,8 +891,7 @@ class PulserApp(ctk.CTk):
                 self.modbus.enqueue_write(
                     CH_BASE[row["ch"]] + CH_MODE_OFF, MODE_LABEL_TO_CODE[row["mode"]]
                 )
-            if any(MODE_LABEL_TO_CODE[row["mode"]] != MODE_OFF for row in rows):
-                self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
+            self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
 
             # Dwell in small slices so stop is responsive
             deadline = time.time() + dwell_ms / 1000.0

@@ -136,6 +136,7 @@ class BconModbus:
 
     def set_off(self, channel: int) -> None:
         self._write_reg(REG_CH_MODE[channel], 0)
+        self.apply_modes()
 
     def fire_pulse(self, channel: int, duration_ms: int) -> None:
         self._write_reg(REG_CH_PULSE_MS[channel], int(duration_ms))

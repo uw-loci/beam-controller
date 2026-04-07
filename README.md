@@ -247,7 +247,7 @@ Broadcast address (slave ID 0) is accepted for write commands; no response is se
 | `0` | NOP (also serves as a watchdog heartbeat write) |
 | `1` | All channels OFF (sets all three channels to `Off` mode immediately) |
 | `2` or `3` | Clear fault latch (only succeeds if no overcurrent is active and interlock is satisfied) |
-| `4` | Apply all staged non-`Off` channel mode writes together |
+| `4` | Apply all staged channel mode writes together |
 
 ---
 
@@ -257,7 +257,7 @@ One set of four registers per channel. Address formula: `10 × (ch)` where `ch` 
 
 | Address | CH | Name | R/W | Range / Values | Description |
 |---|---|---|---|---|---|
-| 10 | 1 | `CH1_MODE` | R/W | 0–3 | Staged requested mode (see mode table above). Non-`Off` writes are committed when `COMMAND=4` is written. |
+| 10 | 1 | `CH1_MODE` | R/W | 0–3 | Staged requested mode (see mode table above). Writes are committed when `COMMAND=4` is written. |
 | 11 | 1 | `CH1_PULSE_MS` | R/W | 1–60 000 | Pulse duration in milliseconds. |
 | 12 | 1 | `CH1_COUNT` | R/W | 1–10 000 | Number of pulses in a train. Also used to disambiguate Pulse vs. PulseTrain when mode 2 is written. |
 | 13 | 1 | `CH1_ENABLE_TOGGLE` | W | 1 | Write `1` to generate a 100 ms active-HIGH pulse on the CH1 enable-toggle output. |
@@ -272,7 +272,7 @@ One set of four registers per channel. Address formula: `10 × (ch)` where `ch` 
 
 > **Note on mode 2 (PULSE):** Writing `2` to a mode register uses the stored `PULSE_MS` and `COUNT` values. If `COUNT = 1`, a single pulse is fired. If `COUNT > 1`, the firmware automatically runs a pulse train identical to mode `3`.
 
-> **Apply semantics:** Writing `1`, `2`, or `3` to `CHx_MODE` stages that request in the control register. Writing `4` to `COMMAND` commits all staged non-`Off` mode writes together so selected channels start on the same firmware apply boundary. Writing `0` to `CHx_MODE` still stops that channel immediately.
+> **Apply semantics:** Writing `0`, `1`, `2`, or `3` to `CHx_MODE` stages that request in the control register. Writing `4` to `COMMAND` commits all staged mode changes together, so selected channels can start or stop on the same firmware apply boundary. `COMMAND=1` remains the immediate all-off action.
 
 ---
 
@@ -427,7 +427,7 @@ Minimal Tkinter GUI for quick bench testing. Connects to a single port, selects 
 ### `pulser_test_gui.py`
 Full-featured test dashboard (CustomTkinter, dark-mode). Features include:
 - Per-channel parameter entry (duration, count, mode) with Apply button
-- Synchronous start/stop across multiple channels using staged `CH_MODE` writes plus `COMMAND=4`
+- Synchronous start/stop across selected channels using staged `CH_MODE` writes plus `COMMAND=4`
 - CSV pulse sequence player (load a `.csv` file with step definitions)
 - Preset save/load (JSON)
 - Raw register viewer/editor
