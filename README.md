@@ -109,7 +109,7 @@ Each channel independently supports four output modes:
 
 Switching to `DC`, `Pulse`, or `PulseTrain` mode while the channel's `ENABLE_STATUS` input reads as not-enabled automatically triggers a 100 ms **enable-toggle pulse** on the corresponding `PULSER_ENABLE_TOGGLE_OUTPUT_PIN` to assert the external enable latch.
 
-Pulse timing is driven by dedicated **1 ms hardware CTC timers** (TIMER1/3/4 per channel) so pulse durations are accurate regardless of loop() execution time or Modbus processing overhead.
+Pulse timing is driven by dedicated **16-bit compare timers** (`TIMER3`, `TIMER4`, `TIMER5`), one per channel. Each channel schedules its next edge from an ISR using microsecond-based compare chunks, so pulse widths stay stable even while Modbus traffic and LCD work continue in `loop()`.
 
 ---
 
@@ -247,6 +247,7 @@ Broadcast address (slave ID 0) is accepted for write commands; no response is se
 | `0` | NOP (also serves as a watchdog heartbeat write) |
 | `1` | All channels OFF (sets all three channels to `Off` mode immediately) |
 | `2` or `3` | Clear fault latch (only succeeds if no overcurrent is active and interlock is satisfied) |
+| `4` | Apply all staged non-`Off` channel mode writes together |
 
 ---
 
@@ -256,7 +257,7 @@ One set of four registers per channel. Address formula: `10 × (ch)` where `ch` 
 
 | Address | CH | Name | R/W | Range / Values | Description |
 |---|---|---|---|---|---|
-| 10 | 1 | `CH1_MODE` | R/W | 0–3 | Output mode (see mode table above). Writing mode triggers the channel state machine. |
+| 10 | 1 | `CH1_MODE` | R/W | 0–3 | Staged requested mode (see mode table above). Non-`Off` writes are committed when `COMMAND=4` is written. |
 | 11 | 1 | `CH1_PULSE_MS` | R/W | 1–60 000 | Pulse duration in milliseconds. |
 | 12 | 1 | `CH1_COUNT` | R/W | 1–10 000 | Number of pulses in a train. Also used to disambiguate Pulse vs. PulseTrain when mode 2 is written. |
 | 13 | 1 | `CH1_ENABLE_TOGGLE` | W | 1 | Write `1` to generate a 100 ms active-HIGH pulse on the CH1 enable-toggle output. |
@@ -270,6 +271,8 @@ One set of four registers per channel. Address formula: `10 × (ch)` where `ch` 
 | 33 | 3 | `CH3_ENABLE_TOGGLE` | W | 1 | Same as CH1. |
 
 > **Note on mode 2 (PULSE):** Writing `2` to a mode register uses the stored `PULSE_MS` and `COUNT` values. If `COUNT = 1`, a single pulse is fired. If `COUNT > 1`, the firmware automatically runs a pulse train identical to mode `3`.
+
+> **Apply semantics:** Writing `1`, `2`, or `3` to `CHx_MODE` stages that request in the control register. Writing `4` to `COMMAND` commits all staged non-`Off` mode writes together so selected channels start on the same firmware apply boundary. Writing `0` to `CHx_MODE` still stops that channel immediately.
 
 ---
 
@@ -424,7 +427,7 @@ Minimal Tkinter GUI for quick bench testing. Connects to a single port, selects 
 ### `pulser_test_gui.py`
 Full-featured test dashboard (CustomTkinter, dark-mode). Features include:
 - Per-channel parameter entry (duration, count, mode) with Apply button
-- Synchronous start/stop across multiple channels simultaneously
+- Synchronous start/stop across multiple channels using staged `CH_MODE` writes plus `COMMAND=4`
 - CSV pulse sequence player (load a `.csv` file with step definitions)
 - Preset save/load (JSON)
 - Raw register viewer/editor

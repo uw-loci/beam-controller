@@ -68,6 +68,7 @@
 | WC-002 | REG_TELEMETRY_MS | Any valid uint16 | Accepts, updates Runtime::telemetryPeriodMs |
 | WC-003 | REG_COMMAND=1 | Value=1 | All channels OFF immediately |
 | WC-004 | REG_COMMAND=2/3 with fault active | Fault still asserted | **Returns exception 0x04** (FaultStillActive) - prevents unsafe clearing |
+| WC-005 | REG_COMMAND=4 | Pending staged CHx mode writes | Commits all staged non-OFF channel starts together |
 
 ### 2.3 Write Multiple Registers (Function Code 0x10)
 
@@ -93,7 +94,7 @@
 ### 3.1 DC Mode (Mode=1)
 
 ```cpp
-// Test: Set channel mode to DC, verify continuous HIGH on gate output pin
+// Test: stage channel mode to DC, then write REG_COMMAND=4 and verify continuous HIGH
 ```
 
 | Check | Expected |
@@ -105,7 +106,7 @@
 ### 3.2 Pulse Mode (Mode=2, count=1)
 
 ```cpp
-// Test: Set pulse duration to 500ms, verify single pulse output
+// Test: set pulse duration to 500ms, stage mode=2, then write REG_COMMAND=4
 ```
 
 | Check | Expected |
@@ -113,12 +114,12 @@
 | Initial state | Gate HIGH immediately |
 | After pulse duration | Gate returns LOW automatically |
 | pulsesRemaining | Decrements from 1→0, then mode becomes OFF |
-| Timer behavior | Single channel timer armed for durationMs |
+| Timer behavior | Corresponding TIMER3/4/5 compare ISR is armed for durationMs |
 
 ### 3.3 Pulse Train Mode (Mode=3)
 
 ```cpp
-// Test: Set pulse train with duration=200ms, count=5
+// Test: set pulse train with duration=200ms, count=5, then write REG_COMMAND=4
 ```
 
 | Check | Expected |

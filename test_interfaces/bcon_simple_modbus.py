@@ -14,6 +14,7 @@ logging.getLogger("pymodbus").setLevel(logging.ERROR)
 
 REG_WATCHDOG_MS = 0
 REG_COMMAND = 2
+COMMAND_APPLY_STAGED_MODES = 4
 REG_CH_MODE = {1: 10, 2: 20, 3: 30}
 REG_CH_PULSE_MS = {1: 11, 2: 21, 3: 31}
 REG_SYS_STATE_BASE = 100
@@ -123,11 +124,15 @@ class BconModbus:
     def kick_watchdog(self) -> None:
         self._write_reg(REG_COMMAND, 0)
 
+    def apply_modes(self) -> None:
+        self._write_reg(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
+
     def set_watchdog_ms(self, value_ms: int) -> None:
         self._write_reg(REG_WATCHDOG_MS, int(value_ms))
 
     def set_dc(self, channel: int) -> None:
         self._write_reg(REG_CH_MODE[channel], 1)
+        self.apply_modes()
 
     def set_off(self, channel: int) -> None:
         self._write_reg(REG_CH_MODE[channel], 0)
@@ -135,6 +140,7 @@ class BconModbus:
     def fire_pulse(self, channel: int, duration_ms: int) -> None:
         self._write_reg(REG_CH_PULSE_MS[channel], int(duration_ms))
         self._write_reg(REG_CH_MODE[channel], 2)
+        self.apply_modes()
 
     def read_status(self) -> BconStatus:
         # One sys read + three individual channel reads (9 regs each).

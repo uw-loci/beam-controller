@@ -4,7 +4,7 @@ Pulser Upper‑Machine GUI (Tkinter + Material-style with CustomTkinter)
 - Auto-scans serial ports (Linux) by default
 - Features implemented (first version):
   - Manual per-channel control (start/stop/single + parameter write)
-  - Synchronous start/stop via `SYNC_CMD` (mask + action)
+    - Synchronous start via staged mode writes + `COMMAND=4` apply
   - Safety / Remote-ARM register and physical enable input monitoring
   - Register viewer/editor (read/write holding registers)
   - Presets save/load (JSON)
@@ -56,6 +56,7 @@ TOTAL_REGS = 160
 REG_WATCHDOG_MS = 0
 REG_TELEMETRY_MS = 1
 REG_COMMAND = 2
+COMMAND_APPLY_STAGED_MODES = 4
 
 CH_BASE = [10, 20, 30]
 CH_MODE_OFF = 0
@@ -639,6 +640,8 @@ class PulserApp(ctk.CTk):
         self.modbus.enqueue_write(base + CH_COUNT_OFF, count)
         mode_code = MODE_LABEL_TO_CODE[mode_label]
         self.modbus.enqueue_write(base + CH_MODE_OFF, mode_code)
+        if mode_code != MODE_OFF:
+            self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
         self._log_event(f"Applied CH{ch+1}: mode={mode_label} duration_ms={duration} count={count}")
 
     def _set_mode(self, ch, mode):
@@ -646,6 +649,8 @@ class PulserApp(ctk.CTk):
         if mode == MODE_PULSE:
             self.modbus.enqueue_write(base + CH_COUNT_OFF, 1)
         self.modbus.enqueue_write(base + CH_MODE_OFF, mode)
+        if mode != MODE_OFF:
+            self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
         mode_name = {
             MODE_OFF: "OFF",
             MODE_DC: "DC",
@@ -687,8 +692,9 @@ class PulserApp(ctk.CTk):
 
         Strategy for minimising inter-channel start jitter:
           Phase 1 – write all duration/count values for every selected channel.
-          Phase 2 – write mode (start command) for every selected channel.
-        Both phases are enqueued atomically so no other write can interleave.
+                    Phase 2 – stage mode writes for every selected channel.
+                    Phase 3 – emit COMMAND=4 so firmware commits the staged modes together.
+                All phases are enqueued atomically so no other write can interleave.
         """
         selected = [ch for ch in range(3) if self.sync_ch_vars[ch].get()]
         if not selected:
@@ -723,9 +729,13 @@ class PulserApp(ctk.CTk):
                 self.modbus.enqueue_write(CH_BASE[ch] + CH_PULSE_MS_OFF, dur)
                 self.modbus.enqueue_write(CH_BASE[ch] + CH_COUNT_OFF, cnt)
 
-        # Phase 2: write mode for all channels — keeps mode writes as close together as possible
+        # Phase 2: stage modes for all channels
         for ch, (_, _, mode_code, _) in params.items():
             self.modbus.enqueue_write(CH_BASE[ch] + CH_MODE_OFF, mode_code)
+
+        # Phase 3: commit all staged non-OFF modes together in firmware
+        if any(params[ch][2] != MODE_OFF for ch in selected):
+            self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
 
         self._log_event(
             "Sync Start: " +
@@ -867,11 +877,13 @@ class PulserApp(ctk.CTk):
                 self.modbus.enqueue_write(base + CH_PULSE_MS_OFF, row["duration_ms"])
                 self.modbus.enqueue_write(base + CH_COUNT_OFF, row["count"])
 
-            # Phase 2: write modes together to minimise inter-channel start jitter
+            # Phase 2: stage modes together, then commit them with one apply command
             for row in rows:
                 self.modbus.enqueue_write(
                     CH_BASE[row["ch"]] + CH_MODE_OFF, MODE_LABEL_TO_CODE[row["mode"]]
                 )
+            if any(MODE_LABEL_TO_CODE[row["mode"]] != MODE_OFF for row in rows):
+                self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
 
             # Dwell in small slices so stop is responsive
             deadline = time.time() + dwell_ms / 1000.0

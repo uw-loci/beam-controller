@@ -12,10 +12,10 @@
 //  System control:
 //    0  WATCHDOG_MS      SW watchdog timeout (50-60000 ms, default 1500)
 //    1  TELEMETRY_MS     Informational host poll interval (not enforced)
-//    2  COMMAND          0=NOP, 1=AllOff, 2/3=ClearFault
+//    2  COMMAND          0=NOP, 1=AllOff, 2/3=ClearFault, 4=ApplyStagedModes
 //
 //  Channel control  (base = ch*10, ch=1..3):
-//    base+0  MODE           0=Off 1=DC 2=Pulse 3=PulseTrain
+//    base+0  MODE           staged requested mode; write COMMAND=4 to apply
 //    base+1  PULSE_MS       pulse duration ms (1-60000)
 //    base+2  COUNT          pulse count (1-10000)
 //    base+3  ENABLE_TOGGLE  write 1 = 100 ms enable-toggle pulse
@@ -42,6 +42,7 @@
 
 #include <Arduino.h>
 #include <avr/wdt.h>
+#include <util/atomic.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <ModbusRTU.h>
@@ -75,6 +76,9 @@ namespace Pins {
     constexpr uint8_t GATE_B  = A13;  // Pulser B gate drive
     constexpr uint8_t GATE_C  = A9;   // Pulser C gate drive
     constexpr uint8_t GATE[3] = { GATE_A, GATE_B, GATE_C };
+    constexpr uint8_t GATE_PORT_MASK[3] = { _BV(PK3), _BV(PK5), _BV(PK1) };
+    constexpr uint8_t GATE_ALL_PORT_MASK =
+        (uint8_t)(GATE_PORT_MASK[0] | GATE_PORT_MASK[1] | GATE_PORT_MASK[2]);
 
     // Gate state indicator LEDs (blue panel LEDs)
     constexpr uint8_t LED_A  = 3;
@@ -115,6 +119,13 @@ namespace Cfg {
     constexpr uint32_t COUNT_MAX              = 10000;
 
     constexpr uint32_t ENA_TOGGLE_MS          = 100;
+    constexpr uint32_t ENA_TOGGLE_US          = ENA_TOGGLE_MS * 1000UL;
+
+    constexpr uint8_t  TIMER_CTC_BITS         = 0x08;
+    constexpr uint8_t  TIMER_CS_64_BITS       = 0x03;
+    constexpr uint8_t  TIMER_SYNC_HOLD_BITS   = _BV(TSM);
+    constexpr uint32_t TIMER_TICK_US          = 4;
+    constexpr uint32_t TIMER_MAX_CHUNK_US     = TIMER_TICK_US * 65535UL;
 
     constexpr uint32_t LCD_REFRESH_MS         = 1000;
     constexpr uint32_t LCD_SERIAL_DEFER_MS    = 50;
@@ -164,6 +175,8 @@ static uint32_t g_bootMs       = 0;
 static uint16_t g_lastError    = 0;
 static uint32_t g_telemMs      = Cfg::WD_DEFAULT_MS;
 static uint32_t g_lastSerialByteMs  = 0;
+static volatile uint8_t g_modeRegisterClearMask = 0;
+static bool     g_commandRegisterClearPending = false;
 
 // LCD row caches
 static char g_lcdBuf [Cfg::LCD_ROWS][Cfg::LCD_COLS + 1];
@@ -180,10 +193,62 @@ static LiquidCrystal_I2C *g_lcd = nullptr;
 // ===========================================================================
 // Helpers
 // ===========================================================================
+static inline uint8_t channelMaskBit(uint8_t idx) {
+    return (uint8_t)(1u << idx);
+}
+
+static uint8_t channelMaskToGatePortMask(uint8_t channelMask) {
+    uint8_t portMask = 0;
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if (channelMask & channelMaskBit(idx)) portMask |= Pins::GATE_PORT_MASK[idx];
+    }
+    return portMask;
+}
+
+static void setLedStateUnsafe(uint8_t idx, bool high) {
+    switch (idx) {
+        case 0:
+            if (high) PORTE |= _BV(PE5);
+            else      PORTE &= (uint8_t)~_BV(PE5);
+            break;
+        case 1:
+            if (high) PORTE |= _BV(PE3);
+            else      PORTE &= (uint8_t)~_BV(PE3);
+            break;
+        default:
+            if (high) PORTH |= _BV(PH4);
+            else      PORTH &= (uint8_t)~_BV(PH4);
+            break;
+    }
+}
+
+static void writeGateChannelsUnsafe(uint8_t highChannelMask, uint8_t lowChannelMask) {
+    const uint8_t changeChannelMask = (uint8_t)(highChannelMask | lowChannelMask);
+    const uint8_t changePortMask = channelMaskToGatePortMask(changeChannelMask);
+    const uint8_t highPortMask = channelMaskToGatePortMask(highChannelMask);
+
+    PORTK = (uint8_t)((PORTK & (uint8_t)~changePortMask) | highPortMask);
+
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if ((changeChannelMask & channelMaskBit(idx)) == 0) continue;
+        setLedStateUnsafe(idx, (highChannelMask & channelMaskBit(idx)) != 0);
+    }
+}
+
+static void setGateStateUnsafe(uint8_t idx, bool high) {
+    if (high) writeGateChannelsUnsafe(channelMaskBit(idx), 0);
+    else      writeGateChannelsUnsafe(0, channelMaskBit(idx));
+}
+
+static void setGateState(uint8_t idx, bool high) {
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        setGateStateUnsafe(idx, high);
+    }
+}
+
 static void forceAllOutputsLow() {
-    for (uint8_t i = 0; i < 3; i++) {
-        digitalWrite(Pins::GATE[i], LOW);
-        digitalWrite(Pins::LED[i],  LOW);
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        writeGateChannelsUnsafe(0, channelMaskBit(0) | channelMaskBit(1) | channelMaskBit(2));
     }
 }
 
@@ -201,6 +266,10 @@ static void feedWatchdog() {
     g_wdLastFeedMs = millis();
 }
 
+static uint32_t pulseDurationUs(uint32_t pulseMs) {
+    return pulseMs * 1000UL;
+}
+
 static TopState evaluateState() {
     if (!interlockOk())  return TopState::SafeInterlock;
     if (!watchdogOk())   return TopState::SafeWatchdog;
@@ -208,92 +277,319 @@ static TopState evaluateState() {
     return TopState::Ready;
 }
 
+static void timerHardwareInit() {
+    TCCR3A = 0; TCCR3B = Cfg::TIMER_CTC_BITS; TIMSK3 &= (uint8_t)~_BV(OCIE3A); TIFR3 = _BV(OCF3A); TCNT3 = 0; OCR3A = 0;
+    TCCR4A = 0; TCCR4B = Cfg::TIMER_CTC_BITS; TIMSK4 &= (uint8_t)~_BV(OCIE4A); TIFR4 = _BV(OCF4A); TCNT4 = 0; OCR4A = 0;
+    TCCR5A = 0; TCCR5B = Cfg::TIMER_CTC_BITS; TIMSK5 &= (uint8_t)~_BV(OCIE5A); TIFR5 = _BV(OCF5A); TCNT5 = 0; OCR5A = 0;
+}
+
+static void timerStopUnsafe(uint8_t idx) {
+    switch (idx) {
+        case 0:
+            TCCR3B = Cfg::TIMER_CTC_BITS;
+            TIMSK3 &= (uint8_t)~_BV(OCIE3A);
+            TIFR3 = _BV(OCF3A);
+            break;
+        case 1:
+            TCCR4B = Cfg::TIMER_CTC_BITS;
+            TIMSK4 &= (uint8_t)~_BV(OCIE4A);
+            TIFR4 = _BV(OCF4A);
+            break;
+        default:
+            TCCR5B = Cfg::TIMER_CTC_BITS;
+            TIMSK5 &= (uint8_t)~_BV(OCIE5A);
+            TIFR5 = _BV(OCF5A);
+            break;
+    }
+}
+
+static uint16_t timerTicksForUs(uint32_t durationUs) {
+    uint32_t ticks = (durationUs + (Cfg::TIMER_TICK_US - 1)) / Cfg::TIMER_TICK_US;
+    if (ticks == 0) ticks = 1;
+    if (ticks > 65535UL) ticks = 65535UL;
+    return (uint16_t)ticks;
+}
+
+static void timerPrimeNextChunkUnsafe(uint8_t idx) {
+    Channel& c = g_ch[idx];
+    uint32_t chunkUs = c.phaseRemainingUs;
+    if (chunkUs == 0) {
+        timerStopUnsafe(idx);
+        return;
+    }
+    if (chunkUs > Cfg::TIMER_MAX_CHUNK_US) chunkUs = Cfg::TIMER_MAX_CHUNK_US;
+    c.phaseRemainingUs -= chunkUs;
+    const uint16_t ticks = timerTicksForUs(chunkUs);
+
+    switch (idx) {
+        case 0:
+            TCNT3 = 0;
+            OCR3A = (uint16_t)(ticks - 1);
+            TIFR3 = _BV(OCF3A);
+            TIMSK3 |= _BV(OCIE3A);
+            break;
+        case 1:
+            TCNT4 = 0;
+            OCR4A = (uint16_t)(ticks - 1);
+            TIFR4 = _BV(OCF4A);
+            TIMSK4 |= _BV(OCIE4A);
+            break;
+        default:
+            TCNT5 = 0;
+            OCR5A = (uint16_t)(ticks - 1);
+            TIFR5 = _BV(OCF5A);
+            TIMSK5 |= _BV(OCIE5A);
+            break;
+    }
+}
+
+static void timerStartUnsafe(uint8_t idx) {
+    switch (idx) {
+        case 0: TCCR3B = Cfg::TIMER_CTC_BITS | Cfg::TIMER_CS_64_BITS; break;
+        case 1: TCCR4B = Cfg::TIMER_CTC_BITS | Cfg::TIMER_CS_64_BITS; break;
+        default: TCCR5B = Cfg::TIMER_CTC_BITS | Cfg::TIMER_CS_64_BITS; break;
+    }
+}
+
+static void queueModeRegisterClearUnsafe(uint8_t idx) {
+    g_modeRegisterClearMask |= channelMaskBit(idx);
+}
+
+static void stopChannelUnsafe(uint8_t idx, bool clearRequestedMode) {
+    Channel& c = g_ch[idx];
+    timerStopUnsafe(idx);
+    c.mode             = Mode::Off;
+    c.pulsesLeft       = 0;
+    c.phaseDurationUs  = 0;
+    c.phaseRemainingUs = 0;
+    c.inHighPhase      = false;
+    setGateStateUnsafe(idx, false);
+    if (clearRequestedMode) {
+        c.requestedMode    = Mode::Off;
+        c.modeApplyPending = false;
+    }
+}
+
+static void stopChannel(uint8_t idx, bool clearRequestedMode = true) {
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        stopChannelUnsafe(idx, clearRequestedMode);
+    }
+}
+
 static void triggerEnableToggle(uint8_t idx) {
-    g_ch[idx].enaToggleStartMs = millis();
+    g_ch[idx].enaToggleStartUs = micros();
     g_ch[idx].enaToggleActive  = true;
     digitalWrite(Pins::ENA[idx], HIGH);
 }
 
-static void startPulse(uint8_t idx) {
-    Channel& c     = g_ch[idx];
-    c.pulsesLeft   = c.count;
-    c.phaseStartMs = millis();
-    c.inHighPhase  = true;
-    digitalWrite(Pins::GATE[idx], HIGH);
-    digitalWrite(Pins::LED[idx],  HIGH);
-}
-
-static void stopChannel(uint8_t idx) {
-    Channel& c    = g_ch[idx];
-    c.mode        = Mode::Off;
-    c.pulsesLeft  = 0;
-    c.inHighPhase = false;
-    digitalWrite(Pins::GATE[idx], LOW);
-    digitalWrite(Pins::LED[idx],  LOW);
-}
-
-// ===========================================================================
-// Channel state machines
-// ===========================================================================
-static void tickChannel(uint8_t idx) {
-    Channel& c = g_ch[idx];
-
-    // Enable-toggle one-shot
-    if (c.enaToggleActive) {
-        if ((millis() - c.enaToggleStartMs) >= Cfg::ENA_TOGGLE_MS) {
+static void tickEnableToggles() {
+    const uint32_t nowUs = micros();
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        Channel& c = g_ch[idx];
+        if (!c.enaToggleActive) continue;
+        if ((nowUs - c.enaToggleStartUs) >= Cfg::ENA_TOGGLE_US) {
             digitalWrite(Pins::ENA[idx], LOW);
             c.enaToggleActive = false;
         }
     }
+}
 
-    if (g_state != TopState::Ready) return;
+static uint8_t collectDueTimerMask(uint8_t sourceMask) {
+    uint8_t dueMask = sourceMask;
+    if ((TIMSK3 & _BV(OCIE3A)) && (TIFR3 & _BV(OCF3A))) dueMask |= channelMaskBit(0);
+    if ((TIMSK4 & _BV(OCIE4A)) && (TIFR4 & _BV(OCF4A))) dueMask |= channelMaskBit(1);
+    if ((TIMSK5 & _BV(OCIE5A)) && (TIFR5 & _BV(OCF5A))) dueMask |= channelMaskBit(2);
+    return dueMask;
+}
 
-    switch (c.mode) {
-        case Mode::Off:
-            break;
+static void startTimersTogetherUnsafe(uint8_t restartMask) {
+    if (restartMask == 0) return;
 
-        case Mode::DC:
-            // Pin held HIGH; nothing to tick
-            break;
+    const bool syncStart = (restartMask & (uint8_t)(restartMask - 1u)) != 0;
+    if (syncStart) GTCCR = Cfg::TIMER_SYNC_HOLD_BITS;
 
-        case Mode::Pulse:
-        case Mode::PulseTrain: {
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if ((restartMask & channelMaskBit(idx)) == 0) continue;
+        timerPrimeNextChunkUnsafe(idx);
+        timerStartUnsafe(idx);
+    }
+
+    if (syncStart) GTCCR = 0;
+}
+
+static void handleTimerCompareBatch(uint8_t sourceMask) {
+    const uint8_t dueMask = collectDueTimerMask(sourceMask);
+    uint8_t gateHighMask = 0;
+    uint8_t gateLowMask  = 0;
+    uint8_t restartMask  = 0;
+
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if ((dueMask & channelMaskBit(idx)) == 0) continue;
+        timerStopUnsafe(idx);
+    }
+
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if ((dueMask & channelMaskBit(idx)) == 0) continue;
+
+        Channel& c = g_ch[idx];
+        if (c.mode != Mode::Pulse && c.mode != Mode::PulseTrain) {
+            gateLowMask |= channelMaskBit(idx);
+            continue;
+        }
+
+        if (c.phaseRemainingUs > 0) {
+            restartMask |= channelMaskBit(idx);
+            continue;
+        }
+
+        if (c.inHighPhase) {
+            gateLowMask |= channelMaskBit(idx);
+            if (c.pulsesLeft > 0) c.pulsesLeft--;
             if (c.pulsesLeft == 0) {
-                c.mode        = Mode::Off;
-                c.inHighPhase = false;
-                digitalWrite(Pins::GATE[idx], LOW);
-                digitalWrite(Pins::LED[idx],  LOW);
-                mb.cbDisable(); mb.Hreg(Reg::CH_MODE(idx + 1), 0); mb.cbEnable(true);
-                break;
+                c.mode             = Mode::Off;
+                c.phaseDurationUs  = 0;
+                c.phaseRemainingUs = 0;
+                c.inHighPhase      = false;
+                queueModeRegisterClearUnsafe(idx);
+                continue;
+            }
+            c.inHighPhase = false;
+        } else {
+            c.inHighPhase = true;
+            gateHighMask |= channelMaskBit(idx);
+        }
+
+        c.phaseRemainingUs = c.phaseDurationUs;
+        restartMask |= channelMaskBit(idx);
+    }
+
+    if ((gateHighMask | gateLowMask) != 0) {
+        writeGateChannelsUnsafe(gateHighMask, gateLowMask);
+    }
+
+    startTimersTogetherUnsafe(restartMask);
+}
+
+ISR(TIMER3_COMPA_vect) {
+    handleTimerCompareBatch(channelMaskBit(0));
+}
+
+ISR(TIMER4_COMPA_vect) {
+    handleTimerCompareBatch(channelMaskBit(1));
+}
+
+ISR(TIMER5_COMPA_vect) {
+    handleTimerCompareBatch(channelMaskBit(2));
+}
+
+static bool applyPendingModes() {
+    uint8_t applyMask = 0;
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if (g_ch[idx].modeApplyPending) applyMask |= channelMaskBit(idx);
+    }
+    if (applyMask == 0) return true;
+
+    if (evaluateState() != TopState::Ready) {
+        g_lastError = 10;
+        mb.Hreg(Reg::LAST_ERROR, g_lastError);
+        return false;
+    }
+
+    uint8_t pulseMask = 0;
+    uint8_t gateHighMask = 0;
+    uint8_t gateLowMask = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        for (uint8_t idx = 0; idx < 3; idx++) {
+            if ((applyMask & channelMaskBit(idx)) == 0) continue;
+            gateLowMask |= channelMaskBit(idx);
+            stopChannelUnsafe(idx, false);
+        }
+
+        for (uint8_t idx = 0; idx < 3; idx++) {
+            if ((applyMask & channelMaskBit(idx)) == 0) continue;
+
+            Channel& c = g_ch[idx];
+            c.modeApplyPending = false;
+
+            if (c.requestedMode == Mode::DC) {
+                c.mode = Mode::DC;
+                gateHighMask |= channelMaskBit(idx);
+                continue;
             }
 
-            uint32_t elapsed = millis() - c.phaseStartMs;
+            if (c.requestedMode != Mode::Pulse && c.requestedMode != Mode::PulseTrain) {
+                c.mode = Mode::Off;
+                continue;
+            }
 
-            if (c.inHighPhase) {
-                if (elapsed >= c.pulseMs) {
-                    digitalWrite(Pins::GATE[idx], LOW);
-                    digitalWrite(Pins::LED[idx],  LOW);
-                    c.pulsesLeft--;
-                    if (c.pulsesLeft == 0) {
-                        c.mode        = Mode::Off;
-                        c.inHighPhase = false;
-                        mb.cbDisable(); mb.Hreg(Reg::CH_MODE(idx + 1), 0); mb.cbEnable(true);
-                    } else {
-                        c.inHighPhase  = false;
-                        c.phaseStartMs = millis();
-                    }
-                }
+            c.mode             = c.requestedMode;
+            c.pulsesLeft       = c.count;
+            c.phaseDurationUs  = pulseDurationUs(c.pulseMs);
+            c.phaseRemainingUs = c.phaseDurationUs;
+            c.inHighPhase      = true;
+            gateHighMask |= channelMaskBit(idx);
+            pulseMask |= channelMaskBit(idx);
+        }
+
+        if ((gateHighMask | gateLowMask) != 0) {
+            writeGateChannelsUnsafe(gateHighMask, gateLowMask);
+        }
+
+        startTimersTogetherUnsafe(pulseMask);
+    }
+
+    return true;
+}
+
+static void handleSafetyTrip() {
+    uint8_t clearMask = 0;
+
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        for (uint8_t idx = 0; idx < 3; idx++) {
+            Channel& c = g_ch[idx];
+            const bool clearRequestedMode =
+                c.modeApplyPending || c.mode == Mode::Pulse || c.mode == Mode::PulseTrain;
+
+            if (clearRequestedMode) {
+                stopChannelUnsafe(idx, true);
+                clearMask |= channelMaskBit(idx);
             } else {
-                if (elapsed >= c.pulseMs) {
-                    c.inHighPhase  = true;
-                    c.phaseStartMs = millis();
-                    digitalWrite(Pins::GATE[idx], HIGH);
-                    digitalWrite(Pins::LED[idx],  HIGH);
-                }
+                timerStopUnsafe(idx);
             }
-            break;
         }
     }
+
+    if (clearMask != 0) {
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            g_modeRegisterClearMask |= clearMask;
+        }
+    }
+}
+
+static void syncDeferredRegisters() {
+    if (g_commandRegisterClearPending) {
+        mb.cbDisable();
+        mb.Hreg(Reg::COMMAND, 0);
+        mb.cbEnable(true);
+        g_commandRegisterClearPending = false;
+    }
+
+    uint8_t clearMask = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        clearMask = g_modeRegisterClearMask;
+        g_modeRegisterClearMask = 0;
+    }
+
+    if (clearMask == 0) return;
+
+    mb.cbDisable();
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if ((clearMask & channelMaskBit(idx)) == 0) continue;
+        g_ch[idx].requestedMode = Mode::Off;
+        g_ch[idx].modeApplyPending = false;
+        mb.Hreg(Reg::CH_MODE(idx + 1), 0);
+    }
+    mb.cbEnable(true);
 }
 
 static void applyDC() {
@@ -303,8 +599,7 @@ static void applyDC() {
     }
     for (uint8_t i = 0; i < 3; i++) {
         if (g_ch[i].mode == Mode::DC) {
-            digitalWrite(Pins::GATE[i], HIGH);
-            digitalWrite(Pins::LED[i],  HIGH);
+            setGateState(i, true);
         }
     }
 }
@@ -315,38 +610,28 @@ static void applyDC() {
 static void handleModeWrite(uint8_t idx, uint16_t val) {
     Mode newMode = (Mode)(val & 0x03);
 
+    if (newMode == Mode::Off) {
+        g_ch[idx].requestedMode = Mode::Off;
+        g_ch[idx].modeApplyPending = false;
+        stopChannel(idx, true);
+        return;
+    }
+
     // Use evaluateState() directly — g_state is stale inside mb.task() callbacks
     // (it is only refreshed in loop() after mb.task() returns).
-    if (newMode != Mode::Off && evaluateState() != TopState::Ready) {
+    if (evaluateState() != TopState::Ready) {
         g_lastError = 10;
         mb.Hreg(Reg::LAST_ERROR, g_lastError);
         // Do NOT call mb.Hreg(CH_MODE, …) here — the library triggers ON_SET callbacks
         // on Hreg writes, which would recurse back into this callback indefinitely.
-        // The cbSetCHxMode return value (g_ch[idx].mode, unchanged) restores the register.
+        // The cbSetCHxMode return value (g_ch[idx].requestedMode, unchanged) restores the register.
         return;
     }
 
-    g_ch[idx].mode = newMode;
+    if (newMode == Mode::Pulse && g_ch[idx].count > 1) newMode = Mode::PulseTrain;
 
-    if (newMode == Mode::Off) {
-        g_ch[idx].pulsesLeft  = 0;
-        g_ch[idx].inHighPhase = false;
-        digitalWrite(Pins::GATE[idx], LOW);
-        digitalWrite(Pins::LED[idx],  LOW);
-
-    } else if (newMode == Mode::DC) {
-        g_ch[idx].pulsesLeft  = 0;
-        g_ch[idx].inHighPhase = false;
-        digitalWrite(Pins::GATE[idx], HIGH);
-        digitalWrite(Pins::LED[idx],  HIGH);
-
-    } else {
-        // Auto-elevate Pulse → PulseTrain when count > 1.
-        // No mb.Hreg(CH_MODE, …) call here — cbSetCHxMode returns g_ch[idx].mode
-        // which is what the library stores in the register.
-        if (g_ch[idx].count > 1) g_ch[idx].mode = Mode::PulseTrain;
-        startPulse(idx);
-    }
+    g_ch[idx].requestedMode = newMode;
+    g_ch[idx].modeApplyPending = true;
 }
 
 // ===========================================================================
@@ -370,7 +655,7 @@ uint16_t cbSetCommand(TRegister* reg, uint16_t val) {
     switch (val) {
         case 0: break;
         case 1:
-            for (uint8_t i = 0; i < 3; i++) stopChannel(i);
+            for (uint8_t i = 0; i < 3; i++) stopChannel(i, true);
             // Disable callbacks while updating control registers to avoid triggering
             // cbSetCHxMode from within cbSetCommand (cross-callback writes).
             mb.cbDisable();
@@ -381,18 +666,22 @@ uint16_t cbSetCommand(TRegister* reg, uint16_t val) {
             if (!interlockOk()) { g_lastError = 12; mb.Hreg(Reg::LAST_ERROR, g_lastError); }
             else g_faultLatched = false;
             break;
+        case 4:
+            applyPendingModes();
+            break;
         default: break;
     }
-    return 0;
+    g_commandRegisterClearPending = (val != 0);
+    return val;
 }
 
-// Return g_ch[idx].mode (may differ from val due to Pulse→PulseTrain elevation);
+// Return g_ch[idx].requestedMode (may differ from val due to Pulse→PulseTrain elevation);
 // the library stores the callback return value — this is the ONLY safe way to
 // update the control register because mb.Hreg(CH_MODE, …) inside a callback
 // would re-trigger this same callback (infinite recursion).
-uint16_t cbSetCH1Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(0, val); return (uint16_t)g_ch[0].mode; }
-uint16_t cbSetCH2Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(1, val); return (uint16_t)g_ch[1].mode; }
-uint16_t cbSetCH3Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(2, val); return (uint16_t)g_ch[2].mode; }
+uint16_t cbSetCH1Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(0, val); return (uint16_t)g_ch[0].requestedMode; }
+uint16_t cbSetCH2Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(1, val); return (uint16_t)g_ch[1].requestedMode; }
+uint16_t cbSetCH3Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(2, val); return (uint16_t)g_ch[2].requestedMode; }
 
 uint16_t cbSetCH1PulseMs(TRegister* reg, uint16_t val) {
     feedWatchdog();
@@ -446,12 +735,18 @@ uint16_t cbGetLastError   (TRegister* reg, uint16_t val) {
 }
 
 static uint16_t liveChField(uint8_t idx, uint8_t field) {
-    const Channel& c = g_ch[idx];
+    Mode activeMode = Mode::Off;
+    uint32_t pulsesLeft = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        activeMode = g_ch[idx].mode;
+        pulsesLeft = g_ch[idx].pulsesLeft;
+    }
+
     switch (field) {
-        case 0: return (uint16_t)c.mode;
-        case 1: return (uint16_t)c.pulseMs;
-        case 2: return (uint16_t)c.count;
-        case 3: return (uint16_t)c.pulsesLeft;
+        case 0: return (uint16_t)activeMode;
+        case 1: return (uint16_t)g_ch[idx].pulseMs;
+        case 2: return (uint16_t)g_ch[idx].count;
+        case 3: return (uint16_t)pulsesLeft;
         case 4: case 5: case 6: case 7: return 0;  // not wired in HW rev 2026-03-17
         case 8: return (digitalRead(Pins::GATE[idx]) == HIGH) ? 1 : 0;
         default: return 0;
@@ -597,13 +892,18 @@ static void lcdUpdate() {
 
     // Rows 1-3: per channel
     for (uint8_t i = 0; i < 3; i++) {
-        const Channel& c = g_ch[i];
+        Mode activeMode = Mode::Off;
+        uint32_t pulsesLeft = 0;
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            activeMode = g_ch[i].mode;
+            pulsesLeft = g_ch[i].pulsesLeft;
+        }
         snprintf(g_lcdBuf[i + 1], Cfg::LCD_COLS + 1,
                  "CH%d %s O:%d R:%-5u   ",
                  i + 1,
-                 modeAbbrev(c.mode),
+                 modeAbbrev(activeMode),
                  (digitalRead(Pins::GATE[i]) == HIGH) ? 1 : 0,
-                 (unsigned int)(c.pulsesLeft & 0xFFFFu));
+                 (unsigned int)(pulsesLeft & 0xFFFFu));
     }
 
     // Write only changed rows; disable TWI between writes to reduce I2C noise
@@ -634,6 +934,7 @@ void setup() {
         pinMode(Pins::ENA[i],  OUTPUT); digitalWrite(Pins::ENA[i],  LOW);
     }
     pinMode(Pins::INTERLOCK, INPUT);  // external circuit provides signal; no pull-up
+    timerHardwareInit();
 
     // Modbus
 #if BCON_USE_USB_SERIAL
@@ -676,7 +977,11 @@ void loop() {
 
     mb.task();
 
-    g_state = evaluateState();
+    const TopState nextState = evaluateState();
+    if (g_state == TopState::Ready && nextState != TopState::Ready) {
+        handleSafetyTrip();
+    }
+    g_state = nextState;
 
     if (g_state != TopState::Ready) {
         forceAllOutputsLow();
@@ -684,7 +989,8 @@ void loop() {
         applyDC();
     }
 
-    for (uint8_t i = 0; i < 3; i++) tickChannel(i);
+    tickEnableToggles();
+    syncDeferredRegisters();
 
 #if BCON_ENABLE_LCD
     lcdUpdate();

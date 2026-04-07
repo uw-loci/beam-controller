@@ -21,14 +21,17 @@ enum class Mode : uint8_t {
 
 // Per-channel runtime state
 struct Channel {
-    Mode     mode             = Mode::Off;
-    uint32_t pulseMs          = 10;
-    uint32_t count            = 1;
+    volatile Mode mode             = Mode::Off;
+    Mode          requestedMode    = Mode::Off;
+    uint32_t      pulseMs          = 10;
+    uint32_t      count            = 1;
 
-    uint32_t pulsesLeft       = 0;
-    uint32_t phaseStartMs     = 0;
-    bool     inHighPhase      = false;
+    volatile uint32_t pulsesLeft       = 0;
+    volatile uint32_t phaseDurationUs  = 0;
+    volatile uint32_t phaseRemainingUs = 0;
+    volatile bool     inHighPhase      = false;
+    bool              modeApplyPending = false;
 
-    uint32_t enaToggleStartMs = 0;
+    uint32_t enaToggleStartUs = 0;
     bool     enaToggleActive  = false;
 };
