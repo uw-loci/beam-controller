@@ -172,6 +172,7 @@ static uint32_t g_lastSerialByteMs  = 0;
 static volatile bool    g_pulseOutputsEnabled = false;
 static volatile uint8_t g_modeSyncPendingMask = 0;
 static volatile uint8_t g_applyEventPendingMask = 0;
+static bool g_commandClearPending = false;
 
 // LCD row caches
 static char g_lcdBuf [Cfg::LCD_ROWS][Cfg::LCD_COLS + 1];
@@ -322,7 +323,9 @@ ISR(TIMER5_COMPA_vect) {
 
             case Mode::Pulse:
             case Mode::PulseTrain:
-                c.mode                = c.requestedMode;
+                c.mode                = (c.requestedMode == Mode::Pulse && c.count > 1)
+                                        ? Mode::PulseTrain
+                                        : c.requestedMode;
                 c.pulsesLeft          = c.count;
                 c.phaseTicksRemaining = msToPulseTicks(c.pulseMs);
                 c.inHighPhase         = true;
@@ -387,9 +390,12 @@ static void syncRuntimeModeToRegisters() {
         pendingMask = g_modeSyncPendingMask;
         g_modeSyncPendingMask = 0;
     }
-    if (!pendingMask) return;
+    bool clearCommand = g_commandClearPending;
+    g_commandClearPending = false;
+    if (!pendingMask && !clearCommand) return;
 
     mb.cbDisable();
+    if (clearCommand) mb.Hreg(Reg::COMMAND, 0);
     for (uint8_t idx = 0; idx < 3; idx++) {
         if ((pendingMask & (uint8_t)(1U << idx)) != 0) {
             Mode mode = Mode::Off;
@@ -422,8 +428,8 @@ static void applyDC() {
 static void handleModeWrite(uint8_t idx, uint16_t val) {
     Mode newMode = (Mode)(val & 0x03);
 
-    if (newMode == Mode::Pulse && g_ch[idx].count > 1) newMode = Mode::PulseTrain;
-
+    // Preserve the written control-register value so FC06 write verification passes.
+    // Effective Pulse -> PulseTrain promotion happens later when the staged mode is applied.
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
         g_modeSyncPendingMask &= (uint8_t)~(1U << idx);
         g_ch[idx].requestedMode = newMode;
@@ -487,7 +493,9 @@ uint16_t cbSetCommand(TRegister* reg, uint16_t val) {
             break;
         default: break;
     }
-    return 0;
+    // FC06 expects the register to echo the written value; clear non-zero commands later.
+    if (val != 0) g_commandClearPending = true;
+    return val;
 }
 
 // CH_MODE writes now stage requested modes. COMMAND=4 applies all pending

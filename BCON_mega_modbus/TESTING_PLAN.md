@@ -22,7 +22,7 @@ Current contract details that matter for testing:
 - `SYS_STATE` is the watchdog keepalive read path
 - `LAST_ERROR` auto-clears on read
 - Channel status offsets `4-7` are intentionally not wired and should read `0`
-- `Pulse` is auto-promoted to `PulseTrain` when `COUNT > 1`
+- Active pulse runtime is auto-promoted from `Pulse` to `PulseTrain` when `COUNT > 1`
 - `g_faultLatched` exists, but the current source has no hardware fault input path that asserts it during normal bench testing
 
 ## Recommended Bench Setup
@@ -217,6 +217,7 @@ Verify:
 
 - No output changes occur on the `CH_MODE` write alone
 - The staged channels become active together only after `COMMAND=4`
+- The `FC06` response should echo the written command value without raising exception `4`
 - For pulse completion, the control register still returns to `OFF` through the deferred main-loop sync
 
 ### CMD-004 - `COMMAND=2` and `COMMAND=3` ClearFault
@@ -286,7 +287,8 @@ Procedure:
 
 Verify:
 
-- The firmware stores the effective mode as `PulseTrain`
+- The `CH_MODE` control register preserves the written value `2`
+- The live status mode reports the effective runtime mode as `PulseTrain`
 - The output pattern is `HIGH 200 ms` then `LOW 200 ms`, repeated five times total
 - The channel returns to `OFF` at the end
 
