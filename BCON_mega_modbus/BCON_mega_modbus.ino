@@ -121,11 +121,10 @@ namespace Cfg {
     constexpr uint32_t ENA_TOGGLE_MS          = 100;
     constexpr uint32_t ENA_TOGGLE_US          = ENA_TOGGLE_MS * 1000UL;
 
-    constexpr uint8_t  TIMER_CTC_BITS         = 0x08;
     constexpr uint8_t  TIMER_CS_64_BITS       = 0x03;
-    constexpr uint8_t  TIMER_SYNC_HOLD_BITS   = _BV(TSM);
-    constexpr uint32_t TIMER_TICK_US          = 4;
-    constexpr uint32_t TIMER_MAX_CHUNK_US     = TIMER_TICK_US * 65535UL;
+    constexpr uint8_t  TIMER_SYNC_HOLD_BITS   = (uint8_t)(_BV(TSM) | _BV(PSRSYNC));
+    constexpr uint32_t TIMER_TICKS_PER_MS     = 250UL;
+    constexpr uint32_t TIMER_MAX_CHUNK_TICKS  = 65535UL;
 
     constexpr uint32_t LCD_REFRESH_MS         = 1000;
     constexpr uint32_t LCD_SERIAL_DEFER_MS    = 50;
@@ -266,8 +265,8 @@ static void feedWatchdog() {
     g_wdLastFeedMs = millis();
 }
 
-static uint32_t pulseDurationUs(uint32_t pulseMs) {
-    return pulseMs * 1000UL;
+static uint32_t pulseDurationTicks(uint32_t pulseMs) {
+    return pulseMs * Cfg::TIMER_TICKS_PER_MS;
 }
 
 static TopState evaluateState() {
@@ -278,76 +277,100 @@ static TopState evaluateState() {
 }
 
 static void timerHardwareInit() {
-    TCCR3A = 0; TCCR3B = Cfg::TIMER_CTC_BITS; TIMSK3 &= (uint8_t)~_BV(OCIE3A); TIFR3 = _BV(OCF3A); TCNT3 = 0; OCR3A = 0;
-    TCCR4A = 0; TCCR4B = Cfg::TIMER_CTC_BITS; TIMSK4 &= (uint8_t)~_BV(OCIE4A); TIFR4 = _BV(OCF4A); TCNT4 = 0; OCR4A = 0;
-    TCCR5A = 0; TCCR5B = Cfg::TIMER_CTC_BITS; TIMSK5 &= (uint8_t)~_BV(OCIE5A); TIFR5 = _BV(OCF5A); TCNT5 = 0; OCR5A = 0;
+    TCCR3A = 0; TCCR3B = 0; TIMSK3 &= (uint8_t)~_BV(OCIE3A); TIFR3 = _BV(OCF3A); TCNT3 = 0; OCR3A = 0;
+    TCCR4A = 0; TCCR4B = 0; TIMSK4 &= (uint8_t)~_BV(OCIE4A); TIFR4 = _BV(OCF4A); TCNT4 = 0; OCR4A = 0;
+    TCCR5A = 0; TCCR5B = 0; TIMSK5 &= (uint8_t)~_BV(OCIE5A); TIFR5 = _BV(OCF5A); TCNT5 = 0; OCR5A = 0;
 }
 
 static void timerStopUnsafe(uint8_t idx) {
     switch (idx) {
         case 0:
-            TCCR3B = Cfg::TIMER_CTC_BITS;
+            TCCR3B = 0;
             TIMSK3 &= (uint8_t)~_BV(OCIE3A);
             TIFR3 = _BV(OCF3A);
             break;
         case 1:
-            TCCR4B = Cfg::TIMER_CTC_BITS;
+            TCCR4B = 0;
             TIMSK4 &= (uint8_t)~_BV(OCIE4A);
             TIFR4 = _BV(OCF4A);
             break;
         default:
-            TCCR5B = Cfg::TIMER_CTC_BITS;
+            TCCR5B = 0;
             TIMSK5 &= (uint8_t)~_BV(OCIE5A);
             TIFR5 = _BV(OCF5A);
             break;
     }
 }
 
-static uint16_t timerTicksForUs(uint32_t durationUs) {
-    uint32_t ticks = (durationUs + (Cfg::TIMER_TICK_US - 1)) / Cfg::TIMER_TICK_US;
-    if (ticks == 0) ticks = 1;
-    if (ticks > 65535UL) ticks = 65535UL;
-    return (uint16_t)ticks;
+static uint16_t timerReadCounterUnsafe(uint8_t idx) {
+    switch (idx) {
+        case 0: return TCNT3;
+        case 1: return TCNT4;
+        default: return TCNT5;
+    }
 }
 
-static void timerPrimeNextChunkUnsafe(uint8_t idx) {
+static uint16_t timerReadCompareUnsafe(uint8_t idx) {
+    switch (idx) {
+        case 0: return OCR3A;
+        case 1: return OCR4A;
+        default: return OCR5A;
+    }
+}
+
+static void timerWriteCounterUnsafe(uint8_t idx, uint16_t value) {
+    switch (idx) {
+        case 0: TCNT3 = value; break;
+        case 1: TCNT4 = value; break;
+        default: TCNT5 = value; break;
+    }
+}
+
+static void timerClearCompareFlagUnsafe(uint8_t idx) {
+    switch (idx) {
+        case 0: TIFR3 = _BV(OCF3A); break;
+        case 1: TIFR4 = _BV(OCF4A); break;
+        default: TIFR5 = _BV(OCF5A); break;
+    }
+}
+
+static void timerEnableCompareInterruptUnsafe(uint8_t idx) {
+    switch (idx) {
+        case 0: TIMSK3 |= _BV(OCIE3A); break;
+        case 1: TIMSK4 |= _BV(OCIE4A); break;
+        default: TIMSK5 |= _BV(OCIE5A); break;
+    }
+}
+
+static void timerWriteCompareUnsafe(uint8_t idx, uint16_t value) {
+    switch (idx) {
+        case 0: OCR3A = value; break;
+        case 1: OCR4A = value; break;
+        default: OCR5A = value; break;
+    }
+}
+
+static void timerScheduleNextChunkUnsafe(uint8_t idx, bool fromPreviousCompare) {
     Channel& c = g_ch[idx];
-    uint32_t chunkUs = c.phaseRemainingUs;
-    if (chunkUs == 0) {
+    uint32_t chunkTicks = c.phaseRemainingTicks;
+    if (chunkTicks == 0) {
         timerStopUnsafe(idx);
         return;
     }
-    if (chunkUs > Cfg::TIMER_MAX_CHUNK_US) chunkUs = Cfg::TIMER_MAX_CHUNK_US;
-    c.phaseRemainingUs -= chunkUs;
-    const uint16_t ticks = timerTicksForUs(chunkUs);
+    if (chunkTicks > Cfg::TIMER_MAX_CHUNK_TICKS) chunkTicks = Cfg::TIMER_MAX_CHUNK_TICKS;
+    c.phaseRemainingTicks -= chunkTicks;
 
-    switch (idx) {
-        case 0:
-            TCNT3 = 0;
-            OCR3A = (uint16_t)(ticks - 1);
-            TIFR3 = _BV(OCF3A);
-            TIMSK3 |= _BV(OCIE3A);
-            break;
-        case 1:
-            TCNT4 = 0;
-            OCR4A = (uint16_t)(ticks - 1);
-            TIFR4 = _BV(OCF4A);
-            TIMSK4 |= _BV(OCIE4A);
-            break;
-        default:
-            TCNT5 = 0;
-            OCR5A = (uint16_t)(ticks - 1);
-            TIFR5 = _BV(OCF5A);
-            TIMSK5 |= _BV(OCIE5A);
-            break;
-    }
+    const uint16_t base = fromPreviousCompare ? timerReadCompareUnsafe(idx) : timerReadCounterUnsafe(idx);
+    timerWriteCompareUnsafe(idx, (uint16_t)(base + (uint16_t)chunkTicks));
+    timerClearCompareFlagUnsafe(idx);
+    timerEnableCompareInterruptUnsafe(idx);
 }
 
 static void timerStartUnsafe(uint8_t idx) {
     switch (idx) {
-        case 0: TCCR3B = Cfg::TIMER_CTC_BITS | Cfg::TIMER_CS_64_BITS; break;
-        case 1: TCCR4B = Cfg::TIMER_CTC_BITS | Cfg::TIMER_CS_64_BITS; break;
-        default: TCCR5B = Cfg::TIMER_CTC_BITS | Cfg::TIMER_CS_64_BITS; break;
+        case 0: TCCR3B = Cfg::TIMER_CS_64_BITS; break;
+        case 1: TCCR4B = Cfg::TIMER_CS_64_BITS; break;
+        default: TCCR5B = Cfg::TIMER_CS_64_BITS; break;
     }
 }
 
@@ -360,8 +383,8 @@ static void resetChannelRuntimeUnsafe(uint8_t idx, bool clearRequestedMode) {
     timerStopUnsafe(idx);
     c.mode             = Mode::Off;
     c.pulsesLeft       = 0;
-    c.phaseDurationUs  = 0;
-    c.phaseRemainingUs = 0;
+    c.phaseDurationTicks  = 0;
+    c.phaseRemainingTicks = 0;
     c.inHighPhase      = false;
     if (clearRequestedMode) {
         c.requestedMode    = Mode::Off;
@@ -406,43 +429,47 @@ static uint8_t collectDueTimerMask(uint8_t sourceMask) {
     return dueMask;
 }
 
-static void startTimersTogetherUnsafe(uint8_t restartMask) {
-    if (restartMask == 0) return;
+static void startTimersTogetherUnsafe(uint8_t startMask) {
+    if (startMask == 0) return;
 
-    const bool syncStart = (restartMask & (uint8_t)(restartMask - 1u)) != 0;
-    if (syncStart) GTCCR = Cfg::TIMER_SYNC_HOLD_BITS;
-
+    GTCCR = Cfg::TIMER_SYNC_HOLD_BITS;
     for (uint8_t idx = 0; idx < 3; idx++) {
-        if ((restartMask & channelMaskBit(idx)) == 0) continue;
-        timerPrimeNextChunkUnsafe(idx);
+        if ((startMask & channelMaskBit(idx)) == 0) continue;
+        timerStopUnsafe(idx);
+        timerWriteCounterUnsafe(idx, 0);
+        timerScheduleNextChunkUnsafe(idx, false);
         timerStartUnsafe(idx);
     }
+    GTCCR = 0;
+}
 
-    if (syncStart) GTCCR = 0;
+static void armRunningTimersUnsafe(uint8_t timerMask) {
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if ((timerMask & channelMaskBit(idx)) == 0) continue;
+        timerScheduleNextChunkUnsafe(idx, true);
+    }
 }
 
 static void handleTimerCompareBatch(uint8_t sourceMask) {
     const uint8_t dueMask = collectDueTimerMask(sourceMask);
     uint8_t gateHighMask = 0;
     uint8_t gateLowMask  = 0;
-    uint8_t restartMask  = 0;
+    uint8_t nextChunkMask = 0;
 
     for (uint8_t idx = 0; idx < 3; idx++) {
         if ((dueMask & channelMaskBit(idx)) == 0) continue;
-        timerStopUnsafe(idx);
-    }
 
-    for (uint8_t idx = 0; idx < 3; idx++) {
-        if ((dueMask & channelMaskBit(idx)) == 0) continue;
+        timerClearCompareFlagUnsafe(idx);
 
         Channel& c = g_ch[idx];
         if (c.mode != Mode::Pulse && c.mode != Mode::PulseTrain) {
             gateLowMask |= channelMaskBit(idx);
+            timerStopUnsafe(idx);
             continue;
         }
 
-        if (c.phaseRemainingUs > 0) {
-            restartMask |= channelMaskBit(idx);
+        if (c.phaseRemainingTicks > 0) {
+            nextChunkMask |= channelMaskBit(idx);
             continue;
         }
 
@@ -451,9 +478,10 @@ static void handleTimerCompareBatch(uint8_t sourceMask) {
             if (c.pulsesLeft > 0) c.pulsesLeft--;
             if (c.pulsesLeft == 0) {
                 c.mode             = Mode::Off;
-                c.phaseDurationUs  = 0;
-                c.phaseRemainingUs = 0;
+                c.phaseDurationTicks  = 0;
+                c.phaseRemainingTicks = 0;
                 c.inHighPhase      = false;
+                timerStopUnsafe(idx);
                 queueModeRegisterClearUnsafe(idx);
                 continue;
             }
@@ -463,15 +491,15 @@ static void handleTimerCompareBatch(uint8_t sourceMask) {
             gateHighMask |= channelMaskBit(idx);
         }
 
-        c.phaseRemainingUs = c.phaseDurationUs;
-        restartMask |= channelMaskBit(idx);
+        c.phaseRemainingTicks = c.phaseDurationTicks;
+        nextChunkMask |= channelMaskBit(idx);
     }
 
     if ((gateHighMask | gateLowMask) != 0) {
         writeGateChannelsUnsafe(gateHighMask, gateLowMask);
     }
 
-    startTimersTogetherUnsafe(restartMask);
+    armRunningTimersUnsafe(nextChunkMask);
 }
 
 ISR(TIMER3_COMPA_vect) {
@@ -531,8 +559,8 @@ static bool applyPendingModes() {
 
             c.mode             = c.requestedMode;
             c.pulsesLeft       = c.count;
-            c.phaseDurationUs  = pulseDurationUs(c.pulseMs);
-            c.phaseRemainingUs = c.phaseDurationUs;
+            c.phaseDurationTicks  = pulseDurationTicks(c.pulseMs);
+            c.phaseRemainingTicks = c.phaseDurationTicks;
             c.inHighPhase      = true;
             gateHighMask |= channelMaskBit(idx);
             pulseMask |= channelMaskBit(idx);

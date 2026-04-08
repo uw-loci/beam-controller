@@ -109,7 +109,7 @@ Each channel independently supports four output modes:
 
 Switching to `DC`, `Pulse`, or `PulseTrain` mode while the channel's `ENABLE_STATUS` input reads as not-enabled automatically triggers a 100 ms **enable-toggle pulse** on the corresponding `PULSER_ENABLE_TOGGLE_OUTPUT_PIN` to assert the external enable latch.
 
-Pulse timing is driven by dedicated **16-bit compare timers** (`TIMER3`, `TIMER4`, `TIMER5`), one per channel. Each channel schedules its next edge from an ISR using microsecond-based compare chunks, so pulse widths stay stable even while Modbus traffic and LCD work continue in `loop()`.
+Pulse timing is driven by dedicated **16-bit compare timers** (`TIMER3`, `TIMER4`, `TIMER5`), one per channel. Each channel schedules the next compare from the previous compare boundary using 4 us timer ticks, which avoids cumulative phase lag from ISR restart overhead while keeping pulse timing stable even when Modbus traffic and LCD work continue in `loop()`.
 
 ---
 

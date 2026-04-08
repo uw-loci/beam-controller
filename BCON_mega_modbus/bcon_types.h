@@ -27,8 +27,8 @@ struct Channel {
     uint32_t      count            = 1;
 
     volatile uint32_t pulsesLeft       = 0;
-    volatile uint32_t phaseDurationUs  = 0;
-    volatile uint32_t phaseRemainingUs = 0;
+    volatile uint32_t phaseDurationTicks  = 0;
+    volatile uint32_t phaseRemainingTicks = 0;
     volatile bool     inHighPhase      = false;
     bool              modeApplyPending = false;
 

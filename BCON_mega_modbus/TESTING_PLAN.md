@@ -152,6 +152,19 @@
 | Unselected channels | Continue running unaffected |
 | COMMAND=1 | Still forces all channels OFF immediately |
 
+### 3.6 Long-Run Sync Drift Test
+
+```cpp
+// Test: configure CH1/CH2/CH3 with identical pulse-train settings,
+// run >=500 pulses, and verify phase alignment does not drift over time.
+```
+
+| Check | Expected |
+|-------|----------|
+| First pulse | Rising edges align within the expected shared-port skew budget |
+| Mid-run pulse (for example pulse 250) | No accumulated inter-channel phase drift |
+| Final pulse | Channels remain aligned; no monotonic lag growth over the run |
+
 ---
 
 ## 4. Watchdog & Interlock Tests
