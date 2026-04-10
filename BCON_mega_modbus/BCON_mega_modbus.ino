@@ -163,6 +163,44 @@ namespace Reg {
 }
 
 // ===========================================================================
+// Supervisory state bookkeeping (first-pass refactor)
+// Preserves the existing pulse engine / timer path while moving command
+// acceptance and high-level control decisions toward a mailbox + supervisor loop.
+// ===========================================================================
+enum class ChannelRunState : uint8_t {
+    Off = 0,
+    Staged = 1,
+    RunningDC = 2,
+    RunningPulse = 3,
+    RunningTrain = 4,
+    Complete = 5,
+    Aborted = 6
+};
+
+enum class StopReason : uint8_t {
+    None = 0,
+    NormalComplete = 1,
+    AllOffCommand = 2,
+    SafeInterlock = 3,
+    SafeWatchdog = 4,
+    FaultLatched = 5,
+    ClearFaultCommand = 6
+};
+
+struct CommandMailbox {
+    volatile bool allOffRequested = false;
+    volatile bool clearFaultRequested = false;
+    volatile bool applyRequested = false;
+};
+
+struct SupervisorChannelState {
+    ChannelRunState runState = ChannelRunState::Off;
+    StopReason stopReason = StopReason::None;
+    bool completionLatched = false;
+    bool abortLatched = false;
+};
+
+// ===========================================================================
 // Global state
 // ===========================================================================
 static Channel  g_ch[3];
@@ -176,6 +214,8 @@ static uint32_t g_telemMs      = Cfg::WD_DEFAULT_MS;
 static uint32_t g_lastSerialByteMs  = 0;
 static volatile uint8_t g_modeRegisterClearMask = 0;
 static bool     g_commandRegisterClearPending = false;
+static CommandMailbox g_cmdMailbox;
+static SupervisorChannelState g_supCh[3];
 
 // LCD row caches
 static char g_lcdBuf [Cfg::LCD_ROWS][Cfg::LCD_COLS + 1];
@@ -274,6 +314,139 @@ static TopState evaluateState() {
     if (!watchdogOk())   return TopState::SafeWatchdog;
     if (g_faultLatched)  return TopState::FaultLatched;
     return TopState::Ready;
+}
+
+static StopReason stopReasonForTopState(TopState state) {
+    switch (state) {
+        case TopState::SafeInterlock: return StopReason::SafeInterlock;
+        case TopState::SafeWatchdog:  return StopReason::SafeWatchdog;
+        case TopState::FaultLatched:  return StopReason::FaultLatched;
+        default:                      return StopReason::None;
+    }
+}
+
+static void supervisorMarkChannelStaged(uint8_t idx) {
+    g_supCh[idx].runState = (g_ch[idx].requestedMode == Mode::Off)
+        ? ChannelRunState::Off
+        : ChannelRunState::Staged;
+    g_supCh[idx].completionLatched = false;
+    g_supCh[idx].abortLatched = false;
+    if (g_ch[idx].requestedMode == Mode::Off) {
+        g_supCh[idx].stopReason = StopReason::None;
+    }
+}
+
+static void supervisorMarkChannelComplete(uint8_t idx) {
+    g_supCh[idx].runState = ChannelRunState::Complete;
+    g_supCh[idx].stopReason = StopReason::NormalComplete;
+    g_supCh[idx].completionLatched = true;
+    g_supCh[idx].abortLatched = false;
+}
+
+static void supervisorMarkChannelAborted(uint8_t idx, StopReason reason) {
+    g_supCh[idx].runState = ChannelRunState::Aborted;
+    g_supCh[idx].stopReason = reason;
+    g_supCh[idx].completionLatched = false;
+    g_supCh[idx].abortLatched = true;
+}
+
+static void supervisorRefreshChannelState(uint8_t idx) {
+    Mode activeMode = Mode::Off;
+    bool applyPending = false;
+    Mode requestedMode = Mode::Off;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        activeMode = g_ch[idx].mode;
+        applyPending = g_ch[idx].modeApplyPending;
+        requestedMode = g_ch[idx].requestedMode;
+    }
+
+    if (activeMode == Mode::DC) {
+        g_supCh[idx].runState = ChannelRunState::RunningDC;
+        g_supCh[idx].stopReason = StopReason::None;
+        g_supCh[idx].completionLatched = false;
+        g_supCh[idx].abortLatched = false;
+        return;
+    }
+    if (activeMode == Mode::Pulse) {
+        g_supCh[idx].runState = ChannelRunState::RunningPulse;
+        g_supCh[idx].stopReason = StopReason::None;
+        g_supCh[idx].completionLatched = false;
+        g_supCh[idx].abortLatched = false;
+        return;
+    }
+    if (activeMode == Mode::PulseTrain) {
+        g_supCh[idx].runState = ChannelRunState::RunningTrain;
+        g_supCh[idx].stopReason = StopReason::None;
+        g_supCh[idx].completionLatched = false;
+        g_supCh[idx].abortLatched = false;
+        return;
+    }
+    if (applyPending && requestedMode != Mode::Off) {
+        g_supCh[idx].runState = ChannelRunState::Staged;
+        return;
+    }
+    if (g_supCh[idx].completionLatched || g_supCh[idx].abortLatched) {
+        return;
+    }
+    g_supCh[idx].runState = ChannelRunState::Off;
+    g_supCh[idx].stopReason = StopReason::None;
+}
+
+static void supervisorRefreshAllChannelStates() {
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        supervisorRefreshChannelState(idx);
+    }
+}
+
+static bool applyPendingModes();
+
+static void supervisorStageCommand(uint16_t val) {
+    switch (val) {
+        case 1: g_cmdMailbox.allOffRequested = true; break;
+        case 2:
+        case 3: g_cmdMailbox.clearFaultRequested = true; break;
+        case 4: g_cmdMailbox.applyRequested = true; break;
+        default: break;
+    }
+}
+
+static void supervisorProcessCommandMailbox() {
+    if (g_cmdMailbox.allOffRequested) {
+        g_cmdMailbox.allOffRequested = false;
+        for (uint8_t i = 0; i < 3; i++) {
+            stopChannel(i, true);
+            supervisorMarkChannelAborted(i, StopReason::AllOffCommand);
+        }
+        mb.cbDisable();
+        for (uint8_t i = 0; i < 3; i++) mb.Hreg(Reg::CH_MODE(i + 1), 0);
+        mb.cbEnable(true);
+        g_commandRegisterClearPending = true;
+    }
+
+    if (g_cmdMailbox.clearFaultRequested) {
+        g_cmdMailbox.clearFaultRequested = false;
+        if (!interlockOk()) {
+            g_lastError = 12;
+            mb.Hreg(Reg::LAST_ERROR, g_lastError);
+        } else {
+            g_faultLatched = false;
+            for (uint8_t i = 0; i < 3; i++) {
+                if (g_supCh[i].abortLatched && g_supCh[i].stopReason == StopReason::FaultLatched) {
+                    g_supCh[i].runState = ChannelRunState::Off;
+                    g_supCh[i].stopReason = StopReason::None;
+                    g_supCh[i].abortLatched = false;
+                    g_supCh[i].completionLatched = false;
+                }
+            }
+        }
+        g_commandRegisterClearPending = true;
+    }
+
+    if (g_cmdMailbox.applyRequested) {
+        g_cmdMailbox.applyRequested = false;
+        applyPendingModes();
+        g_commandRegisterClearPending = true;
+    }
 }
 
 static void timerHardwareInit() {
@@ -578,18 +751,25 @@ static bool applyPendingModes() {
 
 static void handleSafetyTrip() {
     uint8_t clearMask = 0;
+    const StopReason reason = stopReasonForTopState(evaluateState());
 
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
         for (uint8_t idx = 0; idx < 3; idx++) {
             Channel& c = g_ch[idx];
             const bool clearRequestedMode =
                 c.modeApplyPending || c.mode == Mode::Pulse || c.mode == Mode::PulseTrain;
+            const bool wasActive =
+                c.modeApplyPending || c.mode == Mode::DC || c.mode == Mode::Pulse || c.mode == Mode::PulseTrain;
 
             if (clearRequestedMode) {
                 stopChannelUnsafe(idx, true);
                 clearMask |= channelMaskBit(idx);
             } else {
                 timerStopUnsafe(idx);
+            }
+
+            if (wasActive) {
+                supervisorMarkChannelAborted(idx, reason);
             }
         }
     }
@@ -623,6 +803,9 @@ static void syncDeferredRegisters() {
         g_ch[idx].requestedMode = Mode::Off;
         g_ch[idx].modeApplyPending = false;
         mb.Hreg(Reg::CH_MODE(idx + 1), 0);
+        if (!g_supCh[idx].abortLatched) {
+            supervisorMarkChannelComplete(idx);
+        }
     }
     mb.cbEnable(true);
 }
@@ -645,27 +828,11 @@ static void applyDC() {
 static void handleModeWrite(uint8_t idx, uint16_t val) {
     Mode newMode = (Mode)(val & 0x03);
 
-    if (newMode == Mode::Off) {
-        g_ch[idx].requestedMode = Mode::Off;
-        g_ch[idx].modeApplyPending = true;
-        return;
-    }
-
-    // Use evaluateState() directly — g_state is stale inside mb.task() callbacks
-    // (it is only refreshed in loop() after mb.task() returns).
-    if (evaluateState() != TopState::Ready) {
-        g_lastError = 10;
-        mb.Hreg(Reg::LAST_ERROR, g_lastError);
-        // Do NOT call mb.Hreg(CH_MODE, …) here — the library triggers ON_SET callbacks
-        // on Hreg writes, which would recurse back into this callback indefinitely.
-        // The cbSetCHxMode return value (g_ch[idx].requestedMode, unchanged) restores the register.
-        return;
-    }
-
     if (newMode == Mode::Pulse && g_ch[idx].count > 1) newMode = Mode::PulseTrain;
 
     g_ch[idx].requestedMode = newMode;
     g_ch[idx].modeApplyPending = true;
+    supervisorMarkChannelStaged(idx);
 }
 
 // ===========================================================================
@@ -686,26 +853,7 @@ uint16_t cbSetTelemetry(TRegister* reg, uint16_t val) {
 
 uint16_t cbSetCommand(TRegister* reg, uint16_t val) {
     feedWatchdog();
-    switch (val) {
-        case 0: break;
-        case 1:
-            for (uint8_t i = 0; i < 3; i++) stopChannel(i, true);
-            // Disable callbacks while updating control registers to avoid triggering
-            // cbSetCHxMode from within cbSetCommand (cross-callback writes).
-            mb.cbDisable();
-            for (uint8_t i = 0; i < 3; i++) mb.Hreg(Reg::CH_MODE(i + 1), 0);
-            mb.cbEnable(true);
-            break;
-        case 2: case 3:
-            if (!interlockOk()) { g_lastError = 12; mb.Hreg(Reg::LAST_ERROR, g_lastError); }
-            else g_faultLatched = false;
-            break;
-        case 4:
-            applyPendingModes();
-            break;
-        default: break;
-    }
-    g_commandRegisterClearPending = (val != 0);
+    supervisorStageCommand(val);
     return val;
 }
 
@@ -989,8 +1137,13 @@ void setup() {
     lcdInit();
 #endif
 
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        g_supCh[idx] = SupervisorChannelState{};
+    }
+
     // SW watchdog first feed
     feedWatchdog();
+    supervisorRefreshAllChannelStates();
 
     // Hardware WDT last (8 s)
     wdt_enable(WDTO_8S);
@@ -1010,6 +1163,7 @@ void loop() {
 #endif
 
     mb.task();
+    supervisorProcessCommandMailbox();
 
     const TopState nextState = evaluateState();
     if (g_state == TopState::Ready && nextState != TopState::Ready) {
@@ -1025,6 +1179,7 @@ void loop() {
 
     tickEnableToggles();
     syncDeferredRegisters();
+    supervisorRefreshAllChannelStates();
 
 #if BCON_ENABLE_LCD
     lcdUpdate();
