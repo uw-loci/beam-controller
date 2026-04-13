@@ -27,6 +27,10 @@
 //    103  INTERLOCK_OK   1 if arm-beams interlock asserted
 //    104  WATCHDOG_OK    1 if SW watchdog alive
 //    105  LAST_ERROR     last error code (auto-cleared on read)
+//    106  SUP_STATE      supervisor summary state
+//    107  CMD_QUEUE_DEPTH pending supervisor-command count
+//    108  LAST_CMD_CODE  most recent supervisor command code
+//    109  LAST_CMD_RESULT 0=None 1=Queued 2=Executed 3=Rejected
 //
 //  Per-channel status  (base = 110 + (ch-1)*10, offsets 0-8):
 //    +0  mode           active output mode
@@ -38,6 +42,14 @@
 //    +6  overcurrent    (not wired - always 0)
 //    +7  gated          (not wired - always 0)
 //    +8  output_level   1 if gate pin currently HIGH
+//
+//  Supervisor extension status (read-only):
+//    140+(ch-1)*4 +0  CH_SUP_STATE    per-channel semantic state
+//    140+(ch-1)*4 +1  CH_STOP_REASON  most recent stop/abort reason
+//    140+(ch-1)*4 +2  CH_COMPLETE     1 if completion latched
+//    140+(ch-1)*4 +3  CH_ABORTED      1 if abort latched
+//    152  LAST_REJECT_REASON most recent command reject reason
+//    153  LAST_CMD_SEQ      most recent accepted command sequence
 // =============================================================================
 
 #include <Arduino.h>
@@ -128,6 +140,7 @@ namespace Cfg {
 
     constexpr uint32_t LCD_REFRESH_MS         = 1000;
     constexpr uint32_t LCD_SERIAL_DEFER_MS    = 50;
+    constexpr uint8_t  COMMAND_QUEUE_LEN      = 8;
 
     constexpr uint8_t  LCD_COLS               = 20;
     constexpr uint8_t  LCD_ROWS               = 4;
@@ -157,9 +170,17 @@ namespace Reg {
     constexpr uint16_t INTERLOCK_OK  = 103;
     constexpr uint16_t WATCHDOG_OK   = 104;
     constexpr uint16_t LAST_ERROR    = 105;
+    constexpr uint16_t SUP_STATE     = 106;
+    constexpr uint16_t CMD_QUEUE_DEPTH = 107;
+    constexpr uint16_t LAST_CMD_CODE = 108;
+    constexpr uint16_t LAST_CMD_RESULT = 109;
 
     // Per-channel status (ch = 1..3)
     inline constexpr uint16_t CH_STAT_BASE(uint8_t ch) { return (uint16_t)(110 + (ch - 1) * 10); }
+    inline constexpr uint16_t CH_SUP_BASE(uint8_t ch)  { return (uint16_t)(140 + (ch - 1) * 4); }
+
+    constexpr uint16_t LAST_REJECT_REASON = 152;
+    constexpr uint16_t LAST_CMD_SEQ       = 153;
 }
 
 // ===========================================================================
@@ -167,38 +188,35 @@ namespace Reg {
 // Preserves the existing pulse engine / timer path while moving command
 // acceptance and high-level control decisions toward a mailbox + supervisor loop.
 // ===========================================================================
-enum class ChannelRunState : uint8_t {
-    Off = 0,
-    Staged = 1,
-    RunningDC = 2,
-    RunningPulse = 3,
-    RunningTrain = 4,
-    Complete = 5,
-    Aborted = 6
-};
-
-enum class StopReason : uint8_t {
-    None = 0,
-    NormalComplete = 1,
-    AllOffCommand = 2,
-    SafeInterlock = 3,
-    SafeWatchdog = 4,
-    FaultLatched = 5,
-    ClearFaultCommand = 6
-};
-
 struct CommandMailbox {
-    volatile bool allOffRequested = false;
-    volatile bool clearFaultRequested = false;
-    volatile bool applyRequested = false;
+    QueuedCommand queue[Cfg::COMMAND_QUEUE_LEN];
+    uint8_t head = 0;
+    uint8_t tail = 0;
+    uint8_t count = 0;
+    uint16_t nextSeq = 1;
 };
 
-struct SupervisorChannelState {
-    ChannelRunState runState = ChannelRunState::Off;
-    StopReason stopReason = StopReason::None;
-    bool completionLatched = false;
-    bool abortLatched = false;
-};
+// Explicit forward declarations prevent Arduino's auto-prototype pass from
+// emitting prototypes before these enum/struct types are defined.
+static StopReason stopReasonForTopState(TopState state);
+static RejectReason rejectReasonForTopState(TopState state);
+static SupervisorCommandType normalizeSupervisorCommand(uint16_t rawCode);
+static void recordCommandStatus(uint16_t rawCode,
+                                uint16_t seq,
+                                CommandResultCode result,
+                                RejectReason rejectReason = RejectReason::None);
+static bool supervisorAnyChannelActive();
+static SupervisorState currentSupervisorState();
+static bool enqueueSupervisorCommand(uint16_t rawCode);
+static bool dequeueSupervisorCommand(QueuedCommand& out);
+static void supervisorMarkChannelStaged(uint8_t idx);
+static void supervisorMarkChannelComplete(uint8_t idx);
+static void supervisorMarkChannelAborted(uint8_t idx, StopReason reason);
+static void supervisorRefreshChannelState(uint8_t idx);
+static void supervisorRefreshAllChannelStates();
+static bool applyPendingModes();
+static void stopChannel(uint8_t idx, bool clearRequestedMode = true);
+static uint16_t supervisorChField(uint8_t idx, uint8_t field);
 
 // ===========================================================================
 // Global state
@@ -216,6 +234,10 @@ static volatile uint8_t g_modeRegisterClearMask = 0;
 static bool     g_commandRegisterClearPending = false;
 static CommandMailbox g_cmdMailbox;
 static SupervisorChannelState g_supCh[3];
+static uint16_t g_lastCommandSeq = 0;
+static uint16_t g_lastCommandCode = 0;
+static CommandResultCode g_lastCommandResult = CommandResultCode::None;
+static RejectReason g_lastRejectReason = RejectReason::None;
 
 // LCD row caches
 static char g_lcdBuf [Cfg::LCD_ROWS][Cfg::LCD_COLS + 1];
@@ -325,6 +347,100 @@ static StopReason stopReasonForTopState(TopState state) {
     }
 }
 
+static RejectReason rejectReasonForTopState(TopState state) {
+    switch (state) {
+        case TopState::SafeInterlock: return RejectReason::UnsafeInterlock;
+        case TopState::SafeWatchdog:  return RejectReason::UnsafeWatchdog;
+        case TopState::FaultLatched:  return RejectReason::FaultLatched;
+        default:                      return RejectReason::None;
+    }
+}
+
+static SupervisorCommandType normalizeSupervisorCommand(uint16_t rawCode) {
+    switch (rawCode) {
+        case 1: return SupervisorCommandType::AllOff;
+        case 2:
+        case 3: return SupervisorCommandType::ClearFault;
+        case 4: return SupervisorCommandType::Apply;
+        default: return SupervisorCommandType::None;
+    }
+}
+
+static void recordCommandStatus(uint16_t rawCode,
+                                uint16_t seq,
+                                CommandResultCode result,
+                                RejectReason rejectReason) {
+    g_lastCommandCode = rawCode;
+    g_lastCommandSeq = seq;
+    g_lastCommandResult = result;
+    g_lastRejectReason = rejectReason;
+}
+
+static bool supervisorAnyChannelActive() {
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        const ChannelRunState runState = g_supCh[idx].runState;
+        if (runState == ChannelRunState::Staged ||
+            runState == ChannelRunState::RunningDC ||
+            runState == ChannelRunState::RunningPulse ||
+            runState == ChannelRunState::RunningTrain) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static SupervisorState currentSupervisorState() {
+    switch (g_state) {
+        case TopState::SafeInterlock: return SupervisorState::SafeInterlockHold;
+        case TopState::SafeWatchdog:  return SupervisorState::SafeWatchdogHold;
+        case TopState::FaultLatched:  return SupervisorState::FaultHold;
+        case TopState::Ready:
+        default:
+            break;
+    }
+
+    if (g_cmdMailbox.count != 0) return SupervisorState::CommandQueued;
+    if (supervisorAnyChannelActive()) return SupervisorState::Active;
+    return SupervisorState::Idle;
+}
+
+static bool enqueueSupervisorCommand(uint16_t rawCode) {
+    if (rawCode == 0) return true;
+
+    const SupervisorCommandType type = normalizeSupervisorCommand(rawCode);
+    if (type == SupervisorCommandType::None) {
+        recordCommandStatus(rawCode, 0, CommandResultCode::Rejected, RejectReason::InvalidCommand);
+        g_commandRegisterClearPending = true;
+        return false;
+    }
+
+    if (g_cmdMailbox.count >= Cfg::COMMAND_QUEUE_LEN) {
+        recordCommandStatus(rawCode, 0, CommandResultCode::Rejected, RejectReason::QueueFull);
+        g_commandRegisterClearPending = true;
+        return false;
+    }
+
+    QueuedCommand& slot = g_cmdMailbox.queue[g_cmdMailbox.tail];
+    slot.seq = g_cmdMailbox.nextSeq++;
+    slot.rawCode = rawCode;
+    slot.type = type;
+
+    g_cmdMailbox.tail = (uint8_t)((g_cmdMailbox.tail + 1u) % Cfg::COMMAND_QUEUE_LEN);
+    g_cmdMailbox.count++;
+
+    recordCommandStatus(rawCode, slot.seq, CommandResultCode::Queued);
+    return true;
+}
+
+static bool dequeueSupervisorCommand(QueuedCommand& out) {
+    if (g_cmdMailbox.count == 0) return false;
+
+    out = g_cmdMailbox.queue[g_cmdMailbox.head];
+    g_cmdMailbox.head = (uint8_t)((g_cmdMailbox.head + 1u) % Cfg::COMMAND_QUEUE_LEN);
+    g_cmdMailbox.count--;
+    return true;
+}
+
 static void supervisorMarkChannelStaged(uint8_t idx) {
     g_supCh[idx].runState = (g_ch[idx].requestedMode == Mode::Off)
         ? ChannelRunState::Off
@@ -398,53 +514,63 @@ static void supervisorRefreshAllChannelStates() {
     }
 }
 
-static bool applyPendingModes();
-
 static void supervisorStageCommand(uint16_t val) {
-    switch (val) {
-        case 1: g_cmdMailbox.allOffRequested = true; break;
-        case 2:
-        case 3: g_cmdMailbox.clearFaultRequested = true; break;
-        case 4: g_cmdMailbox.applyRequested = true; break;
-        default: break;
-    }
+    enqueueSupervisorCommand(val);
 }
 
 static void supervisorProcessCommandMailbox() {
-    if (g_cmdMailbox.allOffRequested) {
-        g_cmdMailbox.allOffRequested = false;
-        for (uint8_t i = 0; i < 3; i++) {
-            stopChannel(i, true);
-            supervisorMarkChannelAborted(i, StopReason::AllOffCommand);
-        }
-        mb.cbDisable();
-        for (uint8_t i = 0; i < 3; i++) mb.Hreg(Reg::CH_MODE(i + 1), 0);
-        mb.cbEnable(true);
-        g_commandRegisterClearPending = true;
-    }
+    QueuedCommand cmd;
+    while (dequeueSupervisorCommand(cmd)) {
+        bool executed = false;
+        RejectReason rejectReason = RejectReason::None;
 
-    if (g_cmdMailbox.clearFaultRequested) {
-        g_cmdMailbox.clearFaultRequested = false;
-        if (!interlockOk()) {
-            g_lastError = 12;
-            mb.Hreg(Reg::LAST_ERROR, g_lastError);
-        } else {
-            g_faultLatched = false;
-            for (uint8_t i = 0; i < 3; i++) {
-                if (g_supCh[i].abortLatched && g_supCh[i].stopReason == StopReason::FaultLatched) {
-                    g_supCh[i].runState = ChannelRunState::Off;
-                    g_supCh[i].stopReason = StopReason::None;
-                    g_supCh[i].abortLatched = false;
-                    g_supCh[i].completionLatched = false;
+        switch (cmd.type) {
+            case SupervisorCommandType::AllOff:
+                for (uint8_t i = 0; i < 3; i++) {
+                    stopChannel(i, true);
+                    supervisorMarkChannelAborted(i, StopReason::AllOffCommand);
                 }
-            }
-        }
-        g_commandRegisterClearPending = true;
-    }
+                mb.cbDisable();
+                for (uint8_t i = 0; i < 3; i++) mb.Hreg(Reg::CH_MODE(i + 1), 0);
+                mb.cbEnable(true);
+                executed = true;
+                break;
 
-    if (g_cmdMailbox.applyRequested) {
-        g_cmdMailbox.applyRequested = false;
-        applyPendingModes();
+            case SupervisorCommandType::ClearFault:
+                if (!interlockOk()) {
+                    g_lastError = 12;
+                    mb.Hreg(Reg::LAST_ERROR, g_lastError);
+                    rejectReason = RejectReason::ClearFaultWhileInterlockOpen;
+                } else {
+                    g_faultLatched = false;
+                    for (uint8_t i = 0; i < 3; i++) {
+                        if (g_supCh[i].abortLatched &&
+                            g_supCh[i].stopReason == StopReason::FaultLatched) {
+                            g_supCh[i].runState = ChannelRunState::Off;
+                            g_supCh[i].stopReason = StopReason::None;
+                            g_supCh[i].abortLatched = false;
+                            g_supCh[i].completionLatched = false;
+                        }
+                    }
+                    executed = true;
+                }
+                break;
+
+            case SupervisorCommandType::Apply:
+                executed = applyPendingModes();
+                if (!executed) rejectReason = rejectReasonForTopState(evaluateState());
+                break;
+
+            case SupervisorCommandType::None:
+            default:
+                rejectReason = RejectReason::InvalidCommand;
+                break;
+        }
+
+        recordCommandStatus(cmd.rawCode,
+                            cmd.seq,
+                            executed ? CommandResultCode::Executed : CommandResultCode::Rejected,
+                            rejectReason);
         g_commandRegisterClearPending = true;
     }
 }
@@ -570,7 +696,7 @@ static void stopChannelUnsafe(uint8_t idx, bool clearRequestedMode) {
     setGateStateUnsafe(idx, false);
 }
 
-static void stopChannel(uint8_t idx, bool clearRequestedMode = true) {
+static void stopChannel(uint8_t idx, bool clearRequestedMode) {
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
         stopChannelUnsafe(idx, clearRequestedMode);
     }
@@ -757,7 +883,7 @@ static void handleSafetyTrip() {
         for (uint8_t idx = 0; idx < 3; idx++) {
             Channel& c = g_ch[idx];
             const bool clearRequestedMode =
-                c.modeApplyPending || c.mode == Mode::Pulse || c.mode == Mode::PulseTrain;
+                c.modeApplyPending || c.mode == Mode::DC || c.mode == Mode::Pulse || c.mode == Mode::PulseTrain;
             const bool wasActive =
                 c.modeApplyPending || c.mode == Mode::DC || c.mode == Mode::Pulse || c.mode == Mode::PulseTrain;
 
@@ -912,9 +1038,15 @@ uint16_t cbGetSysReason   (TRegister* reg, uint16_t val) { return (uint16_t)g_st
 uint16_t cbGetFaultLatched(TRegister* reg, uint16_t val) { return g_faultLatched ? 1 : 0; }
 uint16_t cbGetInterlockOk (TRegister* reg, uint16_t val) { return interlockOk()  ? 1 : 0; }
 uint16_t cbGetWatchdogOk  (TRegister* reg, uint16_t val) { return watchdogOk()   ? 1 : 0; }
+uint16_t cbGetSupervisorState(TRegister* reg, uint16_t val) { return (uint16_t)currentSupervisorState(); }
+uint16_t cbGetCommandQueueDepth(TRegister* reg, uint16_t val) { return (uint16_t)g_cmdMailbox.count; }
+uint16_t cbGetLastCommandCode(TRegister* reg, uint16_t val) { return g_lastCommandCode; }
+uint16_t cbGetLastCommandResult(TRegister* reg, uint16_t val) { return (uint16_t)g_lastCommandResult; }
 uint16_t cbGetLastError   (TRegister* reg, uint16_t val) {
     uint16_t e = g_lastError; g_lastError = 0; mb.Hreg(Reg::LAST_ERROR, 0); return e;
 }
+uint16_t cbGetLastRejectReason(TRegister* reg, uint16_t val) { return (uint16_t)g_lastRejectReason; }
+uint16_t cbGetLastCommandSeq(TRegister* reg, uint16_t val) { return g_lastCommandSeq; }
 
 static uint16_t liveChField(uint8_t idx, uint8_t field) {
     Mode activeMode = Mode::Off;
@@ -935,6 +1067,16 @@ static uint16_t liveChField(uint8_t idx, uint8_t field) {
     }
 }
 
+static uint16_t supervisorChField(uint8_t idx, uint8_t field) {
+    switch (field) {
+        case 0: return (uint16_t)g_supCh[idx].runState;
+        case 1: return (uint16_t)g_supCh[idx].stopReason;
+        case 2: return g_supCh[idx].completionLatched ? 1 : 0;
+        case 3: return g_supCh[idx].abortLatched ? 1 : 0;
+        default: return 0;
+    }
+}
+
 #define MAKE_CH_STAT_CALLBACKS(IDX)                                                \
 uint16_t cbGetCH##IDX##S0(TRegister* r, uint16_t v){ return liveChField(IDX-1,0);}\
 uint16_t cbGetCH##IDX##S1(TRegister* r, uint16_t v){ return liveChField(IDX-1,1);}\
@@ -949,6 +1091,16 @@ uint16_t cbGetCH##IDX##S8(TRegister* r, uint16_t v){ return liveChField(IDX-1,8)
 MAKE_CH_STAT_CALLBACKS(1)
 MAKE_CH_STAT_CALLBACKS(2)
 MAKE_CH_STAT_CALLBACKS(3)
+
+#define MAKE_CH_SUP_CALLBACKS(IDX)                                                   \
+uint16_t cbGetCH##IDX##SUP0(TRegister* r, uint16_t v){ return supervisorChField(IDX-1,0);}\
+uint16_t cbGetCH##IDX##SUP1(TRegister* r, uint16_t v){ return supervisorChField(IDX-1,1);}\
+uint16_t cbGetCH##IDX##SUP2(TRegister* r, uint16_t v){ return supervisorChField(IDX-1,2);}\
+uint16_t cbGetCH##IDX##SUP3(TRegister* r, uint16_t v){ return supervisorChField(IDX-1,3);}
+
+MAKE_CH_SUP_CALLBACKS(1)
+MAKE_CH_SUP_CALLBACKS(2)
+MAKE_CH_SUP_CALLBACKS(3)
 
 // ===========================================================================
 // Modbus register setup
@@ -989,12 +1141,20 @@ static void modbusSetupRegisters() {
     mb.addHreg(Reg::INTERLOCK_OK,  0);
     mb.addHreg(Reg::WATCHDOG_OK,   0);
     mb.addHreg(Reg::LAST_ERROR,    0);
-    mb.onGetHreg(Reg::SYS_STATE,     cbGetSysState);
-    mb.onGetHreg(Reg::SYS_REASON,    cbGetSysReason);
-    mb.onGetHreg(Reg::FAULT_LATCHED, cbGetFaultLatched);
-    mb.onGetHreg(Reg::INTERLOCK_OK,  cbGetInterlockOk);
-    mb.onGetHreg(Reg::WATCHDOG_OK,   cbGetWatchdogOk);
-    mb.onGetHreg(Reg::LAST_ERROR,    cbGetLastError);
+    mb.addHreg(Reg::SUP_STATE,     0);
+    mb.addHreg(Reg::CMD_QUEUE_DEPTH, 0);
+    mb.addHreg(Reg::LAST_CMD_CODE, 0);
+    mb.addHreg(Reg::LAST_CMD_RESULT, 0);
+    mb.onGetHreg(Reg::SYS_STATE,       cbGetSysState);
+    mb.onGetHreg(Reg::SYS_REASON,      cbGetSysReason);
+    mb.onGetHreg(Reg::FAULT_LATCHED,   cbGetFaultLatched);
+    mb.onGetHreg(Reg::INTERLOCK_OK,    cbGetInterlockOk);
+    mb.onGetHreg(Reg::WATCHDOG_OK,     cbGetWatchdogOk);
+    mb.onGetHreg(Reg::LAST_ERROR,      cbGetLastError);
+    mb.onGetHreg(Reg::SUP_STATE,       cbGetSupervisorState);
+    mb.onGetHreg(Reg::CMD_QUEUE_DEPTH, cbGetCommandQueueDepth);
+    mb.onGetHreg(Reg::LAST_CMD_CODE,   cbGetLastCommandCode);
+    mb.onGetHreg(Reg::LAST_CMD_RESULT, cbGetLastCommandResult);
 
     // Per-channel status
     typedef uint16_t (*CbFn)(TRegister*, uint16_t);
@@ -1016,6 +1176,25 @@ static void modbusSetupRegisters() {
         mb.onGetHreg(Reg::CH_STAT_BASE(2) + f, ch2cbs[f]);
         mb.onGetHreg(Reg::CH_STAT_BASE(3) + f, ch3cbs[f]);
     }
+
+    // Supervisor extension status
+    static const CbFn ch1sup[4] = { cbGetCH1SUP0, cbGetCH1SUP1, cbGetCH1SUP2, cbGetCH1SUP3 };
+    static const CbFn ch2sup[4] = { cbGetCH2SUP0, cbGetCH2SUP1, cbGetCH2SUP2, cbGetCH2SUP3 };
+    static const CbFn ch3sup[4] = { cbGetCH3SUP0, cbGetCH3SUP1, cbGetCH3SUP2, cbGetCH3SUP3 };
+
+    for (uint8_t f = 0; f < 4; f++) {
+        mb.addHreg(Reg::CH_SUP_BASE(1) + f, 0);
+        mb.addHreg(Reg::CH_SUP_BASE(2) + f, 0);
+        mb.addHreg(Reg::CH_SUP_BASE(3) + f, 0);
+        mb.onGetHreg(Reg::CH_SUP_BASE(1) + f, ch1sup[f]);
+        mb.onGetHreg(Reg::CH_SUP_BASE(2) + f, ch2sup[f]);
+        mb.onGetHreg(Reg::CH_SUP_BASE(3) + f, ch3sup[f]);
+    }
+
+    mb.addHreg(Reg::LAST_REJECT_REASON, 0);
+    mb.addHreg(Reg::LAST_CMD_SEQ, 0);
+    mb.onGetHreg(Reg::LAST_REJECT_REASON, cbGetLastRejectReason);
+    mb.onGetHreg(Reg::LAST_CMD_SEQ, cbGetLastCommandSeq);
 }
 
 // ===========================================================================

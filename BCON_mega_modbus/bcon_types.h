@@ -35,3 +35,78 @@ struct Channel {
     uint32_t enaToggleStartUs = 0;
     bool     enaToggleActive  = false;
 };
+
+
+// Supervisor-visible semantic channel state
+enum class ChannelRunState : uint8_t {
+    Off = 0,
+    Staged = 1,
+    RunningDC = 2,
+    RunningPulse = 3,
+    RunningTrain = 4,
+    Complete = 5,
+    Aborted = 6,
+};
+
+// Supervisor stop / abort reasons
+enum class StopReason : uint8_t {
+    None = 0,
+    NormalComplete = 1,
+    AllOffCommand = 2,
+    SafeInterlock = 3,
+    SafeWatchdog = 4,
+    FaultLatched = 5,
+    ClearFaultCommand = 6,
+};
+
+// Overall supervisor summary state
+enum class SupervisorState : uint8_t {
+    Idle = 0,
+    Active = 1,
+    CommandQueued = 2,
+    SafeInterlockHold = 3,
+    SafeWatchdogHold = 4,
+    FaultHold = 5,
+};
+
+// Last-command result reporting
+enum class CommandResultCode : uint8_t {
+    None = 0,
+    Queued = 1,
+    Executed = 2,
+    Rejected = 3,
+};
+
+// Last-command reject reporting
+enum class RejectReason : uint8_t {
+    None = 0,
+    InvalidCommand = 1,
+    QueueFull = 2,
+    UnsafeInterlock = 3,
+    UnsafeWatchdog = 4,
+    FaultLatched = 5,
+    ClearFaultWhileInterlockOpen = 6,
+};
+
+// Normalized supervisor command types derived from Modbus COMMAND writes
+enum class SupervisorCommandType : uint8_t {
+    None = 0,
+    AllOff = 1,
+    ClearFault = 2,
+    Apply = 4,
+};
+
+// Ordered command-queue element
+struct QueuedCommand {
+    uint16_t seq = 0;
+    uint16_t rawCode = 0;
+    SupervisorCommandType type = SupervisorCommandType::None;
+};
+
+// Per-channel semantic state owned by the supervisor
+struct SupervisorChannelState {
+    ChannelRunState runState = ChannelRunState::Off;
+    StopReason stopReason = StopReason::None;
+    bool completionLatched = false;
+    bool abortLatched = false;
+};
