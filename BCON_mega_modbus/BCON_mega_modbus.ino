@@ -1,1196 +1,1032 @@
-// =============================================================================
+//=============================================================================
 // BCON Mega Modbus Firmware
-// Target : Arduino Mega 2560 (ATmega2560)
-// Serial : USB-CDC (Serial) used as Modbus RTU port when USE_USB_SERIAL = 1
-//          Hardware RS-485 (Serial1 + DE/RE pin) otherwise
-// LCD    : 20x4 I2C LCD via LiquidCrystal_I2C (auto-detects 0x27 / 0x3F)
+// Target  : Arduino Mega 2560 (ATmega2560)
+// Comm    : Modbus RTU slave via RS-485 (Serial1 + DE/RE pin D17)
+//           Set BCON_USE_USB_SERIAL 1 for bench/debug via USB-CDC (Serial)
+// LCD     : 20x4 I2C LCD (LiquidCrystal_I2C, auto-detects 0x27 / 0x3F)
+// Library : modbus-esp8266 (ModbusRTU) from libs/modbus-esp8266
+// =============================================================================
+//
+// Modbus register map (holding registers, all R/W unless noted):
+//
+//  System control:
+//    0  WATCHDOG_MS      SW watchdog timeout (50-60000 ms, default 1500)
+//    1  TELEMETRY_MS     Informational host poll interval (not enforced)
+//    2  COMMAND          0=NOP, 1=AllOff, 2/3=ClearFault, 4=ApplyStagedModes
+//
+//  Channel control  (base = ch*10, ch=1..3):
+//    base+0  MODE           staged requested mode (including Off); write COMMAND=4 to apply
+//    base+1  PULSE_MS       pulse duration ms (1-60000)
+//    base+2  COUNT          pulse count (1-10000)
+//    base+3  ENABLE_TOGGLE  write 1 = 100 ms enable-toggle pulse
+//
+//  System status (read-only):
+//    100  SYS_STATE      0=Ready 1=SafeInterlock 2=SafeWatchdog 3=FaultLatched
+//    101  SYS_REASON     mirrors SYS_STATE
+//    102  FAULT_LATCHED  1 if OC fault latched
+//    103  INTERLOCK_OK   1 if arm-beams interlock asserted
+//    104  WATCHDOG_OK    1 if SW watchdog alive
+//    105  LAST_ERROR     last error code (auto-cleared on read)
+//
+//  Per-channel status  (base = 110 + (ch-1)*10, offsets 0-8):
+//    +0  mode           active output mode
+//    +1  pulse_ms       configured pulse duration
+//    +2  count          configured pulse count
+//    +3  remaining      pulses remaining in current train
+//    +4  enable_status  (not wired in HW rev 2026-03-17 - always 0)
+//    +5  power_status   (not wired - always 0)
+//    +6  overcurrent    (not wired - always 0)
+//    +7  gated          (not wired - always 0)
+//    +8  output_level   1 if gate pin currently HIGH
 // =============================================================================
 
 #include <Arduino.h>
-#include <string.h>
 #include <avr/wdt.h>
+#include <util/atomic.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ModbusRTU.h>
+#include "bcon_types.h"
 
 // ---------------------------------------------------------------------------
-// Forward-declare Runtime enums so the early-init hook compiles cleanly
-// before the full namespace body is seen by the compiler.
+// Build-time options
 // ---------------------------------------------------------------------------
-namespace Runtime {
-  enum class OutputMode    : uint8_t;
-  enum class TopLevelState : uint8_t;
-  enum class ModbusError   : uint16_t;
-}
+#define BCON_USE_USB_SERIAL  1   // 0 = RS-485 (production), 1 = USB-CDC (bench)
+#define BCON_ENABLE_LCD      1   // 1 = enable 20x4 I2C LCD
 
 // ---------------------------------------------------------------------------
-// Early-init hook  (.init3 runs before main() / before C++ constructors)
-// Capture MCUSR and immediately disable the watchdog so a previous WDT reset
-// cannot cause an infinite boot-loop.
+// Early-init: capture reset flags and disable WDT before main() runs.
+// Prevents infinite reset loop after a WDT-caused reboot.
 // ---------------------------------------------------------------------------
 uint8_t g_resetFlags __attribute__((section(".noinit")));
 
-void captureResetFlagsAndDisableWatchdog() __attribute__((section(".init3")));
-void captureResetFlagsAndDisableWatchdog() {
-  g_resetFlags = MCUSR;
-  MCUSR = 0;
-  wdt_disable();
+void captureAndDisableWdt() __attribute__((naked, section(".init3")));
+void captureAndDisableWdt() {
+    g_resetFlags = MCUSR;
+    MCUSR = 0;
+    wdt_disable();
 }
 
-// ---------------------------------------------------------------------------
-// Build-time feature selection
-// ---------------------------------------------------------------------------
-#define BCON_MODBUS_USE_USB_SERIAL 1   // 1 = USB-CDC (Serial), 0 = Serial1 RS-485
-#define BCON_ENABLE_I2C_LCD        1   // 1 = I2C LCD enabled, 0 = disabled
+// ===========================================================================
+// Pin assignments  (BCON HW Dev Spec Rev 2026-03-17)
+// ===========================================================================
+namespace Pins {
+    // Gate drive outputs -- AND gate (SN74HCT08) -- TC4427 -- BNC
+    constexpr uint8_t GATE_A  = A11;  // Pulser A gate drive
+    constexpr uint8_t GATE_B  = A13;  // Pulser B gate drive
+    constexpr uint8_t GATE_C  = A9;   // Pulser C gate drive
+    constexpr uint8_t GATE[3] = { GATE_A, GATE_B, GATE_C };
+    constexpr uint8_t GATE_PORT_MASK[3] = { _BV(PK3), _BV(PK5), _BV(PK1) };
+    constexpr uint8_t GATE_ALL_PORT_MASK =
+        (uint8_t)(GATE_PORT_MASK[0] | GATE_PORT_MASK[1] | GATE_PORT_MASK[2]);
 
-#if BCON_MODBUS_USE_USB_SERIAL
-  #define BCON_MODBUS_PORT Serial
-#else
-  #define BCON_MODBUS_PORT Serial1
+    // Gate state indicator LEDs (blue panel LEDs)
+    constexpr uint8_t LED_A  = 3;
+    constexpr uint8_t LED_B  = 5;
+    constexpr uint8_t LED_C  = 7;
+    constexpr uint8_t LED[3] = { LED_A, LED_B, LED_C };
+
+    // Enable-toggle outputs -- 2N7000 NMOS -- PVX DA-15 pin 9
+    constexpr uint8_t ENA_A    = 12;  // Pulser A enable
+    constexpr uint8_t ENA_B    = 11;  // Pulser B enable
+    constexpr uint8_t ENA_C    = 10;  // Pulser C enable
+    constexpr uint8_t ENA[3]   = { ENA_A, ENA_B, ENA_C };
+
+    // RS-485 direction control
+    constexpr uint8_t RS485_DE_RE = 17;
+
+    // Interlock input: isolated Arm Beams signal from Knob Box (active HIGH)
+    constexpr uint8_t INTERLOCK = A0;
+
+    // I2C (fixed on Mega): SDA=D20, SCL=D21 (managed by Wire)
+}
+
+// ===========================================================================
+// Timing & limits
+// ===========================================================================
+namespace Cfg {
+    constexpr uint8_t  SLAVE_ID               = 1;
+    constexpr uint32_t BAUD                   = 115200;
+
+    constexpr uint32_t WD_DEFAULT_MS          = 1500;
+    constexpr uint32_t WD_MIN_MS              = 50;
+    constexpr uint32_t WD_MAX_MS              = 60000;
+    constexpr uint32_t WD_BOOT_GRACE_MS       = 8000;
+
+    constexpr uint32_t PULSE_MS_MIN           = 1;
+    constexpr uint32_t PULSE_MS_MAX           = 60000;
+    constexpr uint32_t COUNT_MIN              = 1;
+    constexpr uint32_t COUNT_MAX              = 10000;
+
+    constexpr uint32_t ENA_TOGGLE_MS          = 100;
+    constexpr uint32_t ENA_TOGGLE_US          = ENA_TOGGLE_MS * 1000UL;
+
+    constexpr uint8_t  TIMER_CS_64_BITS       = 0x03;
+    constexpr uint8_t  TIMER_SYNC_HOLD_BITS   = (uint8_t)(_BV(TSM) | _BV(PSRSYNC));
+    constexpr uint32_t TIMER_TICKS_PER_MS     = 250UL;
+    constexpr uint32_t TIMER_MAX_CHUNK_TICKS  = 65535UL;
+
+    constexpr uint32_t LCD_REFRESH_MS         = 1000;
+    constexpr uint32_t LCD_SERIAL_DEFER_MS    = 50;
+
+    constexpr uint8_t  LCD_COLS               = 20;
+    constexpr uint8_t  LCD_ROWS               = 4;
+    constexpr uint8_t  LCD_ADDR_PRIMARY       = 0x27;
+    constexpr uint8_t  LCD_ADDR_FALLBACK      = 0x3F;
+}
+
+// ===========================================================================
+// Modbus register addresses
+// ===========================================================================
+namespace Reg {
+    constexpr uint16_t WATCHDOG_MS   = 0;    // register address 0
+    constexpr uint16_t TELEMETRY_MS  = 1;    // register address 1
+    constexpr uint16_t COMMAND       = 2;
+
+    // Channel control (ch = 1..3)
+    inline constexpr uint16_t CH_BASE(uint8_t ch)       { return (uint16_t)(ch * 10); }
+    inline constexpr uint16_t CH_MODE(uint8_t ch)       { return CH_BASE(ch) + 0; }
+    inline constexpr uint16_t CH_PULSE_MS(uint8_t ch)   { return CH_BASE(ch) + 1; }
+    inline constexpr uint16_t CH_COUNT(uint8_t ch)      { return CH_BASE(ch) + 2; }
+    inline constexpr uint16_t CH_ENA_TOGGLE(uint8_t ch) { return CH_BASE(ch) + 3; }
+
+    // System status
+    constexpr uint16_t SYS_STATE     = 100;
+    constexpr uint16_t SYS_REASON    = 101;
+    constexpr uint16_t FAULT_LATCHED = 102;
+    constexpr uint16_t INTERLOCK_OK  = 103;
+    constexpr uint16_t WATCHDOG_OK   = 104;
+    constexpr uint16_t LAST_ERROR    = 105;
+
+    // Per-channel status (ch = 1..3)
+    inline constexpr uint16_t CH_STAT_BASE(uint8_t ch) { return (uint16_t)(110 + (ch - 1) * 10); }
+}
+
+// ===========================================================================
+// Global state
+// ===========================================================================
+static Channel  g_ch[3];
+static TopState g_state        = TopState::SafeWatchdog;
+static bool     g_faultLatched = false;
+static uint32_t g_wdTimeoutMs  = Cfg::WD_DEFAULT_MS;
+static uint32_t g_wdLastFeedMs = 0;
+static uint32_t g_bootMs       = 0;
+static uint16_t g_lastError    = 0;
+static uint32_t g_telemMs      = Cfg::WD_DEFAULT_MS;
+static uint32_t g_lastSerialByteMs  = 0;
+static volatile uint8_t g_modeRegisterClearMask = 0;
+static bool     g_commandRegisterClearPending = false;
+
+// LCD row caches
+static char g_lcdBuf [Cfg::LCD_ROWS][Cfg::LCD_COLS + 1];
+static char g_lcdLast[Cfg::LCD_ROWS][Cfg::LCD_COLS + 1];
+static uint32_t g_lcdLastRefreshMs = 0;
+
+// ModbusRTU instance
+ModbusRTU mb;
+
+#if BCON_ENABLE_LCD
+static LiquidCrystal_I2C *g_lcd = nullptr;
 #endif
 
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
-
 // ===========================================================================
-// Config  –  compile-time constants only, no mutable state here
+// Helpers
 // ===========================================================================
-namespace Config {
-
-  constexpr uint8_t  CHANNEL_COUNT   = 3;
-
-  HardwareSerial    &RS485_SERIAL    = BCON_MODBUS_PORT;
-  constexpr uint32_t RS485_BAUD      = 115200;
-  constexpr uint8_t  RS485_DE_RE_PIN = 2;   // RS-485 driver-enable / receive-enable
-  constexpr uint8_t  MODBUS_SLAVE_ID = 1;
-  constexpr bool     USE_USB_SERIAL  = (BCON_MODBUS_USE_USB_SERIAL != 0);
-
-  // Software watchdog: outputs are forced off when the host stops sending
-  // heartbeat writes within this window.
-  constexpr uint32_t DEFAULT_WATCHDOG_TIMEOUT_MS = 1500;
-  constexpr uint32_t HEARTBEAT_MIN_MS            = 50;
-  constexpr uint32_t HEARTBEAT_MAX_MS            = 60000;
-
-  // Grace window after boot before the SW watchdog is enforced; prevents a
-  // cold-start disconnect before the host has had time to connect.
-  constexpr uint32_t WATCHDOG_BOOT_GRACE_MS = 8000;
-
-  constexpr uint32_t DEFAULT_TELEMETRY_MS = 1500;
-
-  // Interlock input
-  constexpr uint8_t KB_INTERLOCK_PIN      = 22;
-  constexpr bool    INTERLOCK_ACTIVE_HIGH = true;
-  constexpr bool    INTERLOCK_USE_PULLUP  = false;
-
-  // Pulse-gate outputs (one per channel)
-  constexpr uint8_t PULSER_GATE_OUTPUT_PINS[CHANNEL_COUNT] = {5, 6, 7};
-
-  // Enable-toggle outputs (momentary pulse to toggle external enable latch)
-  constexpr uint8_t  PULSER_ENABLE_TOGGLE_OUTPUT_PINS[CHANNEL_COUNT] = {8, 9, 10};
-  constexpr bool     ENABLE_TOGGLE_ACTIVE_HIGH = true;
-  constexpr uint16_t ENABLE_TOGGLE_PULSE_MS    = 100;
-
-  // Status inputs (active-low)
-  constexpr bool    STATUS_USE_INTERNAL_PULLUPS            = true;
-  constexpr uint8_t ENABLE_STATUS_PINS[CHANNEL_COUNT]      = {23, 27, 31};
-  constexpr uint8_t POWER_STATUS_PINS[CHANNEL_COUNT]       = {24, 28, 32};
-  constexpr uint8_t OVERCURRENT_STATUS_PINS[CHANNEL_COUNT] = {25, 29, 33};
-  constexpr uint8_t GATED_STATUS_PINS[CHANNEL_COUNT]       = {26, 30, 34};
-
-  // Pulse parameter bounds
-  constexpr uint32_t PULSE_DURATION_MIN_MS = 1;
-  constexpr uint32_t PULSE_DURATION_MAX_MS = 60000;
-  constexpr uint32_t PULSE_COUNT_MIN       = 1;
-  constexpr uint32_t PULSE_COUNT_MAX       = 10000;
-
-  // Modbus framing
-  constexpr size_t   MODBUS_RX_BUFFER_SIZE = 256;
-  constexpr uint32_t MODBUS_FRAME_GAP_MS   = 4;  // inter-frame silence (>= 3.5 char-times)
-
-  // LCD
-  constexpr bool     ENABLE_DEBUG_LCD         = (BCON_ENABLE_I2C_LCD != 0);
-  constexpr uint8_t  LCD_I2C_ADDRESS          = 0x27; // most common PCF8574 backpack
-  constexpr uint8_t  LCD_I2C_ADDRESS_FALLBACK = 0x3F; // alt PCF8574A backpack
-  constexpr uint8_t  LCD_COLS                 = 20;
-  constexpr uint8_t  LCD_ROWS                 = 4;
-  constexpr uint32_t LCD_REFRESH_MS           = 1000;
-
-  constexpr const char *LCD_LABEL_WATCHDOG              = "WDG";
-  constexpr const char *LCD_LABEL_INTERLOCK             = "INT";
-  constexpr const char *LCD_LABEL_FAULT                 = "FLT";
-  constexpr const char *LCD_LABEL_CHANNELS[CHANNEL_COUNT] = {"CH1", "CH2", "CH3"};
-
-}  // namespace Config
-
-// ===========================================================================
-// Runtime  –  mutable state
-// ===========================================================================
-namespace Runtime {
-
-  enum class OutputMode : uint8_t {
-    Off        = 0,
-    DC         = 1,
-    Pulse      = 2,
-    PulseTrain = 3
-  };
-
-  enum class TopLevelState : uint8_t {
-    Ready          = 0,
-    SafeInterlock  = 1,
-    SafeWatchdog   = 2,
-    FaultLatched   = 3
-  };
-
-  enum class ModbusError : uint16_t {
-    None              = 0,
-    IllegalFunction   = 1,
-    IllegalAddress    = 2,
-    IllegalValue      = 3,
-    DeviceFailure     = 4,
-    NotReady          = 10,
-    FaultStillActive  = 11,
-    InterlockNotReady = 12,
-    BufferOverflow    = 13
-  };
-
-  struct ChannelControl {
-    OutputMode mode              = OutputMode::Off;
-    uint32_t   pulseDurationMs   = 100;
-    uint32_t   pulseCount        = 1;
-    uint32_t   pulsesRemaining   = 0;
-    uint32_t   pulseStartMs      = 0;
-    bool       pulseTrainInLowGap = false;
-    bool       lastLevel         = false;
-  };
-
-  ChannelControl channels[Config::CHANNEL_COUNT];
-
-  // ISR-decremented 1 ms countdown timers for pulse state-machines
-  volatile uint32_t chCountdownMs[Config::CHANNEL_COUNT]        = {0};
-  volatile bool     chEventFlag[Config::CHANNEL_COUNT]          = {false};
-
-  // ISR-decremented enable-toggle pulse timers
-  volatile uint16_t enableToggleCountdownMs[Config::CHANNEL_COUNT] = {0};
-  volatile bool     enableToggleEventFlag[Config::CHANNEL_COUNT]   = {false};
-
-  // ISR-decremented LCD refresh timer
-  volatile uint32_t lcdCountdownMs = 0;
-  volatile bool     lcdEventFlag   = false;
-
-  // Software watchdog
-  uint32_t lastCommandMillis       = 0;
-  uint32_t watchdogTimeoutMs       = Config::DEFAULT_WATCHDOG_TIMEOUT_MS;
-  uint32_t watchdogGraceDeadlineMs = 0;
-
-  uint32_t    telemetryPeriodMs = Config::DEFAULT_TELEMETRY_MS;
-  bool        faultLatched      = false;
-  ModbusError lastModbusError   = ModbusError::None;
-
-  // Modbus receive buffer
-  uint8_t  modbusRxBuffer[Config::MODBUS_RX_BUFFER_SIZE] = {0};
-  size_t   modbusRxIndex        = 0;
-  uint32_t lastModbusByteMillis = 0;
-
-}  // namespace Runtime
-
-// ===========================================================================
-// ModbusMap  –  register addresses
-// ===========================================================================
-namespace ModbusMap {
-
-  // System control (R/W unless noted)
-  constexpr uint16_t REG_WATCHDOG_MS  = 0;   // SW watchdog timeout ms
-  constexpr uint16_t REG_TELEMETRY_MS = 1;   // telemetry period ms (informational)
-  constexpr uint16_t REG_COMMAND      = 2;   // W: 0=nop 1=all-off 2/3=clear-fault
-
-  // Per-channel control  (base = 10*(ch+1), fields 0-3)
-  //   field 0 = mode   (0=Off 1=DC 2=Pulse 3=PulseTrain)
-  //   field 1 = pulse_duration_ms
-  //   field 2 = pulse_count
-  //   field 3 = enable_toggle (write 1 to pulse)
-  constexpr uint16_t REG_CH1_MODE          = 10;
-  constexpr uint16_t REG_CH1_PULSE_MS      = 11;
-  constexpr uint16_t REG_CH1_COUNT         = 12;
-  constexpr uint16_t REG_CH1_ENABLE_TOGGLE = 13;
-
-  constexpr uint16_t REG_CH2_MODE          = 20;
-  constexpr uint16_t REG_CH2_PULSE_MS      = 21;
-  constexpr uint16_t REG_CH2_COUNT         = 22;
-  constexpr uint16_t REG_CH2_ENABLE_TOGGLE = 23;
-
-  constexpr uint16_t REG_CH3_MODE          = 30;
-  constexpr uint16_t REG_CH3_PULSE_MS      = 31;
-  constexpr uint16_t REG_CH3_COUNT         = 32;
-  constexpr uint16_t REG_CH3_ENABLE_TOGGLE = 33;
-
-  // System status (R)
-  constexpr uint16_t REG_SYS_STATE     = 100;
-  constexpr uint16_t REG_SYS_REASON    = 101;
-  constexpr uint16_t REG_FAULT_LATCHED = 102;
-  constexpr uint16_t REG_INTERLOCK_OK  = 103;
-  constexpr uint16_t REG_WATCHDOG_OK   = 104;
-  constexpr uint16_t REG_LAST_ERROR    = 105;
-
-  // Per-channel status block (R)
-  // Address = REG_CH_STATUS_BASE + stride*ch + field
-  //   0=mode 1=pulse_ms 2=count 3=remaining
-  //   4=enable_status 5=power_status 6=overcurrent 7=gated 8=output_level
-  constexpr uint16_t REG_CH_STATUS_BASE   = 110;
-  constexpr uint16_t REG_CH_STATUS_STRIDE = 10;
-
-}  // namespace ModbusMap
-
-// ===========================================================================
-// Helper utilities
-// ===========================================================================
-
-static bool activeLowRead(uint8_t pin) {
-  return digitalRead(pin) == LOW;
+static inline uint8_t channelMaskBit(uint8_t idx) {
+    return (uint8_t)(1u << idx);
 }
 
-static bool isInterlockSatisfied() {
-  const bool raw = (digitalRead(Config::KB_INTERLOCK_PIN) == HIGH);
-  return Config::INTERLOCK_ACTIVE_HIGH ? raw : !raw;
-}
-
-// Software watchdog: also returns true during the boot grace window so the
-// system stays in Ready state until the host has had a chance to connect.
-static bool isWatchdogHealthy() {
-  const uint32_t now = millis();
-  if (now < Runtime::watchdogGraceDeadlineMs) return true;
-  return (now - Runtime::lastCommandMillis) <= Runtime::watchdogTimeoutMs;
-}
-
-static bool isAnyOverCurrentAsserted() {
-  for (uint8_t ch = 0; ch < Config::CHANNEL_COUNT; ++ch) {
-    if (activeLowRead(Config::OVERCURRENT_STATUS_PINS[ch])) return true;
-  }
-  return false;
-}
-
-static Runtime::TopLevelState evaluateTopLevelState() {
-  if (!isInterlockSatisfied()) return Runtime::TopLevelState::SafeInterlock;
-  if (!isWatchdogHealthy())    return Runtime::TopLevelState::SafeWatchdog;
-  if (Runtime::faultLatched)   return Runtime::TopLevelState::FaultLatched;
-  return Runtime::TopLevelState::Ready;
-}
-
-static uint16_t topLevelStateToCode(Runtime::TopLevelState s) {
-  return static_cast<uint16_t>(s);
-}
-
-static uint16_t topLevelReasonCode(Runtime::TopLevelState s) {
-  switch (s) {
-    case Runtime::TopLevelState::Ready:         return 0;
-    case Runtime::TopLevelState::SafeInterlock: return 1;
-    case Runtime::TopLevelState::SafeWatchdog:  return 2;
-    case Runtime::TopLevelState::FaultLatched:  return 3;
-    default:                                    return 0;
-  }
-}
-
-static uint16_t modeToCode(Runtime::OutputMode m) {
-  switch (m) {
-    case Runtime::OutputMode::Off:        return 0;
-    case Runtime::OutputMode::DC:         return 1;
-    case Runtime::OutputMode::Pulse:      return 2;
-    case Runtime::OutputMode::PulseTrain: return 3;
-    default:                              return 0;
-  }
-}
-
-static const char *modeToShortString(Runtime::OutputMode m) {
-  switch (m) {
-    case Runtime::OutputMode::Off:        return "OFF";
-    case Runtime::OutputMode::DC:         return "DC ";
-    case Runtime::OutputMode::Pulse:      return "PUL";
-    case Runtime::OutputMode::PulseTrain: return "TRN";
-    default:                              return "UNK";
-  }
-}
-
-static void setModbusError(Runtime::ModbusError err) {
-  Runtime::lastModbusError = err;
-}
-
-// ===========================================================================
-// RS-485 direction control
-// ===========================================================================
-
-static void rs485SetTransmit(bool enabled) {
-  if (Config::USE_USB_SERIAL) { (void)enabled; return; }
-  digitalWrite(Config::RS485_DE_RE_PIN, enabled ? HIGH : LOW);
-}
-
-// ===========================================================================
-// Enable-toggle output (momentary pulse to external enable latch)
-// ===========================================================================
-
-static void pulseEnableToggle(uint8_t ch) {
-  const uint8_t pin   = Config::PULSER_ENABLE_TOGGLE_OUTPUT_PINS[ch];
-  const uint8_t level = Config::ENABLE_TOGGLE_ACTIVE_HIGH ? HIGH : LOW;
-  digitalWrite(pin, level);
-  noInterrupts();
-  Runtime::enableToggleCountdownMs[ch] = Config::ENABLE_TOGGLE_PULSE_MS;
-  Runtime::enableToggleEventFlag[ch]   = false;
-  interrupts();
-}
-
-static void serviceEnableToggleOutputs() {
-  const uint8_t inactive = Config::ENABLE_TOGGLE_ACTIVE_HIGH ? LOW : HIGH;
-  for (uint8_t ch = 0; ch < Config::CHANNEL_COUNT; ++ch) {
-    bool ev = false;
-    noInterrupts();
-    if (Runtime::enableToggleEventFlag[ch]) {
-      Runtime::enableToggleEventFlag[ch] = false;
-      ev = true;
+static uint8_t channelMaskToGatePortMask(uint8_t channelMask) {
+    uint8_t portMask = 0;
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if (channelMask & channelMaskBit(idx)) portMask |= Pins::GATE_PORT_MASK[idx];
     }
-    interrupts();
-    if (ev) digitalWrite(Config::PULSER_ENABLE_TOGGLE_OUTPUT_PINS[ch], inactive);
-  }
+    return portMask;
 }
 
-// ===========================================================================
-// Hardware timer ISRs and setup
-// 1 ms CTC: TIMER1/3/4 for per-channel countdowns, TIMER5 for LCD + enable-toggle
-// ===========================================================================
-
-static void channelTimerTick(uint8_t ch) {
-  if (Runtime::chCountdownMs[ch] > 0) {
-    --Runtime::chCountdownMs[ch];
-    if (Runtime::chCountdownMs[ch] == 0) Runtime::chEventFlag[ch] = true;
-  }
-}
-
-ISR(TIMER1_COMPA_vect) { channelTimerTick(0); }
-ISR(TIMER3_COMPA_vect) { channelTimerTick(1); }
-ISR(TIMER4_COMPA_vect) { channelTimerTick(2); }
-
-ISR(TIMER5_COMPA_vect) {
-  for (uint8_t ch = 0; ch < Config::CHANNEL_COUNT; ++ch) {
-    if (Runtime::enableToggleCountdownMs[ch] > 0) {
-      --Runtime::enableToggleCountdownMs[ch];
-      if (Runtime::enableToggleCountdownMs[ch] == 0)
-        Runtime::enableToggleEventFlag[ch] = true;
+static void setLedStateUnsafe(uint8_t idx, bool high) {
+    switch (idx) {
+        case 0:
+            if (high) PORTE |= _BV(PE5);
+            else      PORTE &= (uint8_t)~_BV(PE5);
+            break;
+        case 1:
+            if (high) PORTE |= _BV(PE3);
+            else      PORTE &= (uint8_t)~_BV(PE3);
+            break;
+        default:
+            if (high) PORTH |= _BV(PH4);
+            else      PORTH &= (uint8_t)~_BV(PH4);
+            break;
     }
-  }
-  if (Runtime::lcdCountdownMs > 0) {
-    --Runtime::lcdCountdownMs;
-    if (Runtime::lcdCountdownMs == 0) Runtime::lcdEventFlag = true;
-  }
 }
 
-// 16 MHz / 64 prescaler / (249+1) = 1000 Hz  =>  1 ms per tick
-static void setupChannelTimers() {
-  noInterrupts();
+static void writeGateChannelsUnsafe(uint8_t highChannelMask, uint8_t lowChannelMask) {
+    const uint8_t changeChannelMask = (uint8_t)(highChannelMask | lowChannelMask);
+    const uint8_t changePortMask = channelMaskToGatePortMask(changeChannelMask);
+    const uint8_t highPortMask = channelMaskToGatePortMask(highChannelMask);
 
-  TCCR1A = 0; TCCR1B = 0; TCNT1 = 0; OCR1A = 249;
-  TCCR1B |= (1 << WGM12) | (1 << CS11) | (1 << CS10);
-  TIMSK1 |= (1 << OCIE1A);
+    PORTK = (uint8_t)((PORTK & (uint8_t)~changePortMask) | highPortMask);
 
-  TCCR3A = 0; TCCR3B = 0; TCNT3 = 0; OCR3A = 249;
-  TCCR3B |= (1 << WGM32) | (1 << CS31) | (1 << CS30);
-  TIMSK3 |= (1 << OCIE3A);
-
-  TCCR4A = 0; TCCR4B = 0; TCNT4 = 0; OCR4A = 249;
-  TCCR4B |= (1 << WGM42) | (1 << CS41) | (1 << CS40);
-  TIMSK4 |= (1 << OCIE4A);
-
-  interrupts();
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if ((changeChannelMask & channelMaskBit(idx)) == 0) continue;
+        setLedStateUnsafe(idx, (highChannelMask & channelMaskBit(idx)) != 0);
+    }
 }
 
-static void setupLcdTimer() {
-  noInterrupts();
-
-  TCCR5A = 0; TCCR5B = 0; TCNT5 = 0; OCR5A = 249;
-  TCCR5B |= (1 << WGM52) | (1 << CS51) | (1 << CS50);
-  TIMSK5 |= (1 << OCIE5A);
-
-  for (uint8_t ch = 0; ch < Config::CHANNEL_COUNT; ++ch) {
-    Runtime::enableToggleCountdownMs[ch] = 0;
-    Runtime::enableToggleEventFlag[ch]   = false;
-  }
-  Runtime::lcdCountdownMs = 0;
-  Runtime::lcdEventFlag   = false;
-
-  interrupts();
+static void setGateStateUnsafe(uint8_t idx, bool high) {
+    if (high) writeGateChannelsUnsafe(channelMaskBit(idx), 0);
+    else      writeGateChannelsUnsafe(0, channelMaskBit(idx));
 }
 
-static void armChannelTimer(uint8_t ch, uint32_t ms) {
-  noInterrupts();
-  Runtime::chCountdownMs[ch] = ms;
-  Runtime::chEventFlag[ch]   = false;
-  interrupts();
+static void setGateState(uint8_t idx, bool high) {
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        setGateStateUnsafe(idx, high);
+    }
 }
-
-static void clearChannelTimer(uint8_t ch) {
-  noInterrupts();
-  Runtime::chCountdownMs[ch] = 0;
-  Runtime::chEventFlag[ch]   = false;
-  interrupts();
-}
-
-static void armLcdTimer(uint32_t ms) {
-  noInterrupts();
-  Runtime::lcdCountdownMs = ms;
-  Runtime::lcdEventFlag   = false;
-  interrupts();
-}
-
-static bool consumeLcdTimerEvent() {
-  bool ev = false;
-  noInterrupts();
-  if (Runtime::lcdEventFlag) { Runtime::lcdEventFlag = false; ev = true; }
-  interrupts();
-  return ev;
-}
-
-// ===========================================================================
-// Channel output control
-// ===========================================================================
 
 static void forceAllOutputsLow() {
-  for (uint8_t ch = 0; ch < Config::CHANNEL_COUNT; ++ch) {
-    digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[ch], LOW);
-    Runtime::channels[ch].lastLevel = false;
-  }
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        writeGateChannelsUnsafe(0, channelMaskBit(0) | channelMaskBit(1) | channelMaskBit(2));
+    }
 }
 
-static void setChannelOff(uint8_t ch) {
-  Runtime::ChannelControl &c = Runtime::channels[ch];
-  c.mode               = Runtime::OutputMode::Off;
-  c.pulsesRemaining    = 0;
-  c.pulseTrainInLowGap = false;
-  c.lastLevel          = false;
-  digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[ch], LOW);
-  clearChannelTimer(ch);
+static bool interlockOk() {
+    return digitalRead(Pins::INTERLOCK) == HIGH;
 }
 
-static void setChannelDC(uint8_t ch) {
-  Runtime::ChannelControl &c = Runtime::channels[ch];
-  c.mode               = Runtime::OutputMode::DC;
-  c.pulsesRemaining    = 0;
-  c.pulseTrainInLowGap = false;
-  c.lastLevel          = true;
-  digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[ch], HIGH);
-  clearChannelTimer(ch);
+static bool watchdogOk() {
+    uint32_t now = millis();
+    if ((now - g_bootMs) < Cfg::WD_BOOT_GRACE_MS) return true;
+    return (now - g_wdLastFeedMs) <= g_wdTimeoutMs;
 }
 
-static void setChannelPulse(uint8_t ch, uint32_t durationMs) {
-  Runtime::ChannelControl &c = Runtime::channels[ch];
-  c.mode               = Runtime::OutputMode::Pulse;
-  c.pulseDurationMs    = durationMs;
-  c.pulseCount         = 1;
-  c.pulsesRemaining    = 1;
-  c.pulseStartMs       = millis();
-  c.pulseTrainInLowGap = false;
-  c.lastLevel          = true;
-  digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[ch], HIGH);
-  armChannelTimer(ch, durationMs);
+static void feedWatchdog() {
+    g_wdLastFeedMs = millis();
 }
 
-static void setChannelPulseTrain(uint8_t ch, uint32_t durationMs, uint32_t count) {
-  Runtime::ChannelControl &c = Runtime::channels[ch];
-  c.mode               = Runtime::OutputMode::PulseTrain;
-  c.pulseDurationMs    = durationMs;
-  c.pulseCount         = count;
-  c.pulsesRemaining    = count;
-  c.pulseStartMs       = millis();
-  c.pulseTrainInLowGap = false;
-  c.lastLevel          = true;
-  digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[ch], HIGH);
-  armChannelTimer(ch, durationMs);
+static uint32_t pulseDurationTicks(uint32_t pulseMs) {
+    return pulseMs * Cfg::TIMER_TICKS_PER_MS;
 }
 
-// Called every loop() to service pulse-train state machines
-static void applyOutputs() {
-  const Runtime::TopLevelState state = evaluateTopLevelState();
-  if (state != Runtime::TopLevelState::Ready) {
-    forceAllOutputsLow();
-    return;
-  }
+static TopState evaluateState() {
+    if (!interlockOk())  return TopState::SafeInterlock;
+    if (!watchdogOk())   return TopState::SafeWatchdog;
+    if (g_faultLatched)  return TopState::FaultLatched;
+    return TopState::Ready;
+}
 
-  for (uint8_t ch = 0; ch < Config::CHANNEL_COUNT; ++ch) {
-    Runtime::ChannelControl &c = Runtime::channels[ch];
-    switch (c.mode) {
+static void timerHardwareInit() {
+    TCCR3A = 0; TCCR3B = 0; TIMSK3 &= (uint8_t)~_BV(OCIE3A); TIFR3 = _BV(OCF3A); TCNT3 = 0; OCR3A = 0;
+    TCCR4A = 0; TCCR4B = 0; TIMSK4 &= (uint8_t)~_BV(OCIE4A); TIFR4 = _BV(OCF4A); TCNT4 = 0; OCR4A = 0;
+    TCCR5A = 0; TCCR5B = 0; TIMSK5 &= (uint8_t)~_BV(OCIE5A); TIFR5 = _BV(OCF5A); TCNT5 = 0; OCR5A = 0;
+}
 
-      case Runtime::OutputMode::Off:
-        if (c.lastLevel) {
-          c.lastLevel = false;
-          digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[ch], LOW);
+static void timerStopUnsafe(uint8_t idx) {
+    switch (idx) {
+        case 0:
+            TCCR3B = 0;
+            TIMSK3 &= (uint8_t)~_BV(OCIE3A);
+            TIFR3 = _BV(OCF3A);
+            break;
+        case 1:
+            TCCR4B = 0;
+            TIMSK4 &= (uint8_t)~_BV(OCIE4A);
+            TIFR4 = _BV(OCF4A);
+            break;
+        default:
+            TCCR5B = 0;
+            TIMSK5 &= (uint8_t)~_BV(OCIE5A);
+            TIFR5 = _BV(OCF5A);
+            break;
+    }
+}
+
+static uint16_t timerReadCounterUnsafe(uint8_t idx) {
+    switch (idx) {
+        case 0: return TCNT3;
+        case 1: return TCNT4;
+        default: return TCNT5;
+    }
+}
+
+static uint16_t timerReadCompareUnsafe(uint8_t idx) {
+    switch (idx) {
+        case 0: return OCR3A;
+        case 1: return OCR4A;
+        default: return OCR5A;
+    }
+}
+
+static void timerWriteCounterUnsafe(uint8_t idx, uint16_t value) {
+    switch (idx) {
+        case 0: TCNT3 = value; break;
+        case 1: TCNT4 = value; break;
+        default: TCNT5 = value; break;
+    }
+}
+
+static void timerClearCompareFlagUnsafe(uint8_t idx) {
+    switch (idx) {
+        case 0: TIFR3 = _BV(OCF3A); break;
+        case 1: TIFR4 = _BV(OCF4A); break;
+        default: TIFR5 = _BV(OCF5A); break;
+    }
+}
+
+static void timerEnableCompareInterruptUnsafe(uint8_t idx) {
+    switch (idx) {
+        case 0: TIMSK3 |= _BV(OCIE3A); break;
+        case 1: TIMSK4 |= _BV(OCIE4A); break;
+        default: TIMSK5 |= _BV(OCIE5A); break;
+    }
+}
+
+static void timerWriteCompareUnsafe(uint8_t idx, uint16_t value) {
+    switch (idx) {
+        case 0: OCR3A = value; break;
+        case 1: OCR4A = value; break;
+        default: OCR5A = value; break;
+    }
+}
+
+static void timerScheduleNextChunkUnsafe(uint8_t idx, bool fromPreviousCompare) {
+    Channel& c = g_ch[idx];
+    uint32_t chunkTicks = c.phaseRemainingTicks;
+    if (chunkTicks == 0) {
+        timerStopUnsafe(idx);
+        return;
+    }
+    if (chunkTicks > Cfg::TIMER_MAX_CHUNK_TICKS) chunkTicks = Cfg::TIMER_MAX_CHUNK_TICKS;
+    c.phaseRemainingTicks -= chunkTicks;
+
+    const uint16_t base = fromPreviousCompare ? timerReadCompareUnsafe(idx) : timerReadCounterUnsafe(idx);
+    timerWriteCompareUnsafe(idx, (uint16_t)(base + (uint16_t)chunkTicks));
+    timerClearCompareFlagUnsafe(idx);
+    timerEnableCompareInterruptUnsafe(idx);
+}
+
+static void timerStartUnsafe(uint8_t idx) {
+    switch (idx) {
+        case 0: TCCR3B = Cfg::TIMER_CS_64_BITS; break;
+        case 1: TCCR4B = Cfg::TIMER_CS_64_BITS; break;
+        default: TCCR5B = Cfg::TIMER_CS_64_BITS; break;
+    }
+}
+
+static void queueModeRegisterClearUnsafe(uint8_t idx) {
+    g_modeRegisterClearMask |= channelMaskBit(idx);
+}
+
+static void resetChannelRuntimeUnsafe(uint8_t idx, bool clearRequestedMode) {
+    Channel& c = g_ch[idx];
+    timerStopUnsafe(idx);
+    c.mode             = Mode::Off;
+    c.pulsesLeft       = 0;
+    c.phaseDurationTicks  = 0;
+    c.phaseRemainingTicks = 0;
+    c.inHighPhase      = false;
+    if (clearRequestedMode) {
+        c.requestedMode    = Mode::Off;
+        c.modeApplyPending = false;
+    }
+}
+
+static void stopChannelUnsafe(uint8_t idx, bool clearRequestedMode) {
+    resetChannelRuntimeUnsafe(idx, clearRequestedMode);
+    setGateStateUnsafe(idx, false);
+}
+
+static void stopChannel(uint8_t idx, bool clearRequestedMode = true) {
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        stopChannelUnsafe(idx, clearRequestedMode);
+    }
+}
+
+static void triggerEnableToggle(uint8_t idx) {
+    g_ch[idx].enaToggleStartUs = micros();
+    g_ch[idx].enaToggleActive  = true;
+    digitalWrite(Pins::ENA[idx], HIGH);
+}
+
+static void tickEnableToggles() {
+    const uint32_t nowUs = micros();
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        Channel& c = g_ch[idx];
+        if (!c.enaToggleActive) continue;
+        if ((nowUs - c.enaToggleStartUs) >= Cfg::ENA_TOGGLE_US) {
+            digitalWrite(Pins::ENA[idx], LOW);
+            c.enaToggleActive = false;
         }
-        clearChannelTimer(ch);
-        break;
+    }
+}
 
-      case Runtime::OutputMode::DC:
-        if (!c.lastLevel) {
-          c.lastLevel = true;
-          digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[ch], HIGH);
+static uint8_t collectDueTimerMask(uint8_t sourceMask) {
+    uint8_t dueMask = sourceMask;
+    if ((TIMSK3 & _BV(OCIE3A)) && (TIFR3 & _BV(OCF3A))) dueMask |= channelMaskBit(0);
+    if ((TIMSK4 & _BV(OCIE4A)) && (TIFR4 & _BV(OCF4A))) dueMask |= channelMaskBit(1);
+    if ((TIMSK5 & _BV(OCIE5A)) && (TIFR5 & _BV(OCF5A))) dueMask |= channelMaskBit(2);
+    return dueMask;
+}
+
+static void startTimersTogetherUnsafe(uint8_t startMask) {
+    if (startMask == 0) return;
+
+    GTCCR = Cfg::TIMER_SYNC_HOLD_BITS;
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if ((startMask & channelMaskBit(idx)) == 0) continue;
+        timerStopUnsafe(idx);
+        timerWriteCounterUnsafe(idx, 0);
+        timerScheduleNextChunkUnsafe(idx, false);
+        timerStartUnsafe(idx);
+    }
+    GTCCR = 0;
+}
+
+static void armRunningTimersUnsafe(uint8_t timerMask) {
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if ((timerMask & channelMaskBit(idx)) == 0) continue;
+        timerScheduleNextChunkUnsafe(idx, true);
+    }
+}
+
+static void handleTimerCompareBatch(uint8_t sourceMask) {
+    const uint8_t dueMask = collectDueTimerMask(sourceMask);
+    uint8_t gateHighMask = 0;
+    uint8_t gateLowMask  = 0;
+    uint8_t nextChunkMask = 0;
+
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if ((dueMask & channelMaskBit(idx)) == 0) continue;
+
+        timerClearCompareFlagUnsafe(idx);
+
+        Channel& c = g_ch[idx];
+        if (c.mode != Mode::Pulse && c.mode != Mode::PulseTrain) {
+            gateLowMask |= channelMaskBit(idx);
+            timerStopUnsafe(idx);
+            continue;
         }
-        clearChannelTimer(ch);
-        break;
 
-      case Runtime::OutputMode::Pulse: {
-        bool ev = false;
-        noInterrupts();
-        if (Runtime::chEventFlag[ch]) { Runtime::chEventFlag[ch] = false; ev = true; }
-        interrupts();
-        if (!ev) break;
+        if (c.phaseRemainingTicks > 0) {
+            nextChunkMask |= channelMaskBit(idx);
+            continue;
+        }
 
-        c.lastLevel       = false;
-        c.mode            = Runtime::OutputMode::Off;
-        c.pulsesRemaining = 0;
-        digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[ch], LOW);
-        clearChannelTimer(ch);
-        break;
-      }
-
-      case Runtime::OutputMode::PulseTrain: {
-        bool ev = false;
-        noInterrupts();
-        if (Runtime::chEventFlag[ch]) { Runtime::chEventFlag[ch] = false; ev = true; }
-        interrupts();
-        if (!ev) break;
-
-        if (c.lastLevel) {
-          // End of HIGH phase: drive LOW, decrement remaining count
-          c.lastLevel = false;
-          digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[ch], LOW);
-          if (c.pulsesRemaining > 0) --c.pulsesRemaining;
-
-          if (c.pulsesRemaining == 0) {
-            c.mode               = Runtime::OutputMode::Off;
-            c.pulseTrainInLowGap = false;
-            clearChannelTimer(ch);
-          } else {
-            c.pulseTrainInLowGap = true;
-            c.pulseStartMs       = millis();
-            armChannelTimer(ch, c.pulseDurationMs); // gap == pulse width
-          }
+        if (c.inHighPhase) {
+            gateLowMask |= channelMaskBit(idx);
+            if (c.pulsesLeft > 0) c.pulsesLeft--;
+            if (c.pulsesLeft == 0) {
+                c.mode             = Mode::Off;
+                c.phaseDurationTicks  = 0;
+                c.phaseRemainingTicks = 0;
+                c.inHighPhase      = false;
+                timerStopUnsafe(idx);
+                queueModeRegisterClearUnsafe(idx);
+                continue;
+            }
+            c.inHighPhase = false;
         } else {
-          // End of LOW gap: drive HIGH for next pulse
-          c.pulseTrainInLowGap = false;
-          c.lastLevel          = true;
-          c.pulseStartMs       = millis();
-          digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[ch], HIGH);
-          armChannelTimer(ch, c.pulseDurationMs);
-
-          if (c.pulsesRemaining == 0) {
-            c.mode      = Runtime::OutputMode::Off;
-            c.lastLevel = false;
-            digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[ch], LOW);
-            clearChannelTimer(ch);
-          }
+            c.inHighPhase = true;
+            gateHighMask |= channelMaskBit(idx);
         }
-        break;
-      }
 
-      default:
-        c.lastLevel = false;
-        digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[ch], LOW);
-        clearChannelTimer(ch);
-        break;
+        c.phaseRemainingTicks = c.phaseDurationTicks;
+        nextChunkMask |= channelMaskBit(idx);
     }
-  }
+
+    if ((gateHighMask | gateLowMask) != 0) {
+        writeGateChannelsUnsafe(gateHighMask, gateLowMask);
+    }
+
+    armRunningTimersUnsafe(nextChunkMask);
+}
+
+ISR(TIMER3_COMPA_vect) {
+    handleTimerCompareBatch(channelMaskBit(0));
+}
+
+ISR(TIMER4_COMPA_vect) {
+    handleTimerCompareBatch(channelMaskBit(1));
+}
+
+ISR(TIMER5_COMPA_vect) {
+    handleTimerCompareBatch(channelMaskBit(2));
+}
+
+static bool applyPendingModes() {
+    uint8_t applyMask = 0;
+    bool hasNonOffRequest = false;
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if (!g_ch[idx].modeApplyPending) continue;
+        applyMask |= channelMaskBit(idx);
+        if (g_ch[idx].requestedMode != Mode::Off) hasNonOffRequest = true;
+    }
+    if (applyMask == 0) return true;
+
+    if (hasNonOffRequest && evaluateState() != TopState::Ready) {
+        g_lastError = 10;
+        mb.Hreg(Reg::LAST_ERROR, g_lastError);
+        return false;
+    }
+
+    uint8_t pulseMask = 0;
+    uint8_t gateHighMask = 0;
+    uint8_t gateLowMask = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        for (uint8_t idx = 0; idx < 3; idx++) {
+            if ((applyMask & channelMaskBit(idx)) == 0) continue;
+            gateLowMask |= channelMaskBit(idx);
+            resetChannelRuntimeUnsafe(idx, false);
+        }
+
+        for (uint8_t idx = 0; idx < 3; idx++) {
+            if ((applyMask & channelMaskBit(idx)) == 0) continue;
+
+            Channel& c = g_ch[idx];
+            c.modeApplyPending = false;
+
+            if (c.requestedMode == Mode::DC) {
+                c.mode = Mode::DC;
+                gateHighMask |= channelMaskBit(idx);
+                continue;
+            }
+
+            if (c.requestedMode != Mode::Pulse && c.requestedMode != Mode::PulseTrain) {
+                c.mode = Mode::Off;
+                continue;
+            }
+
+            c.mode             = c.requestedMode;
+            c.pulsesLeft       = c.count;
+            c.phaseDurationTicks  = pulseDurationTicks(c.pulseMs);
+            c.phaseRemainingTicks = c.phaseDurationTicks;
+            c.inHighPhase      = true;
+            gateHighMask |= channelMaskBit(idx);
+            pulseMask |= channelMaskBit(idx);
+        }
+
+        if ((gateHighMask | gateLowMask) != 0) {
+            writeGateChannelsUnsafe(gateHighMask, gateLowMask);
+        }
+
+        startTimersTogetherUnsafe(pulseMask);
+    }
+
+    return true;
+}
+
+static void handleSafetyTrip() {
+    uint8_t clearMask = 0;
+
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        for (uint8_t idx = 0; idx < 3; idx++) {
+            Channel& c = g_ch[idx];
+            const bool clearRequestedMode =
+                c.modeApplyPending || c.mode == Mode::Pulse || c.mode == Mode::PulseTrain;
+
+            if (clearRequestedMode) {
+                stopChannelUnsafe(idx, true);
+                clearMask |= channelMaskBit(idx);
+            } else {
+                timerStopUnsafe(idx);
+            }
+        }
+    }
+
+    if (clearMask != 0) {
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            g_modeRegisterClearMask |= clearMask;
+        }
+    }
+}
+
+static void syncDeferredRegisters() {
+    if (g_commandRegisterClearPending) {
+        mb.cbDisable();
+        mb.Hreg(Reg::COMMAND, 0);
+        mb.cbEnable(true);
+        g_commandRegisterClearPending = false;
+    }
+
+    uint8_t clearMask = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        clearMask = g_modeRegisterClearMask;
+        g_modeRegisterClearMask = 0;
+    }
+
+    if (clearMask == 0) return;
+
+    mb.cbDisable();
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        if ((clearMask & channelMaskBit(idx)) == 0) continue;
+        g_ch[idx].requestedMode = Mode::Off;
+        g_ch[idx].modeApplyPending = false;
+        mb.Hreg(Reg::CH_MODE(idx + 1), 0);
+    }
+    mb.cbEnable(true);
+}
+
+static void applyDC() {
+    if (g_state != TopState::Ready) {
+        forceAllOutputsLow();
+        return;
+    }
+    for (uint8_t i = 0; i < 3; i++) {
+        if (g_ch[i].mode == Mode::DC) {
+            setGateState(i, true);
+        }
+    }
 }
 
 // ===========================================================================
-// Modbus register address decoders
+// Mode write helper (used by onSet callbacks)
 // ===========================================================================
+static void handleModeWrite(uint8_t idx, uint16_t val) {
+    Mode newMode = (Mode)(val & 0x03);
 
-static bool decodeChannelControlRegister(uint16_t reg, uint8_t &ch, uint8_t &field) {
-  if (reg < 10 || reg > 33) return false;
-  const uint8_t decade = static_cast<uint8_t>(reg / 10);
-  const uint8_t units  = static_cast<uint8_t>(reg % 10);
-  if (decade < 1 || decade > 3 || units > 3) return false;
-  ch    = decade - 1;
-  field = units;
-  return true;
+    if (newMode == Mode::Off) {
+        g_ch[idx].requestedMode = Mode::Off;
+        g_ch[idx].modeApplyPending = true;
+        return;
+    }
+
+    // Use evaluateState() directly — g_state is stale inside mb.task() callbacks
+    // (it is only refreshed in loop() after mb.task() returns).
+    if (evaluateState() != TopState::Ready) {
+        g_lastError = 10;
+        mb.Hreg(Reg::LAST_ERROR, g_lastError);
+        // Do NOT call mb.Hreg(CH_MODE, …) here — the library triggers ON_SET callbacks
+        // on Hreg writes, which would recurse back into this callback indefinitely.
+        // The cbSetCHxMode return value (g_ch[idx].requestedMode, unchanged) restores the register.
+        return;
+    }
+
+    if (newMode == Mode::Pulse && g_ch[idx].count > 1) newMode = Mode::PulseTrain;
+
+    g_ch[idx].requestedMode = newMode;
+    g_ch[idx].modeApplyPending = true;
 }
 
-static bool decodeChannelStatusRegister(uint16_t reg, uint8_t &ch, uint8_t &field) {
-  if (reg < ModbusMap::REG_CH_STATUS_BASE) return false;
-  const uint16_t delta = reg - ModbusMap::REG_CH_STATUS_BASE;
-  const uint8_t  idx   = static_cast<uint8_t>(delta / ModbusMap::REG_CH_STATUS_STRIDE);
-  const uint8_t  off   = static_cast<uint8_t>(delta % ModbusMap::REG_CH_STATUS_STRIDE);
-  if (idx >= Config::CHANNEL_COUNT || off > 8) return false;
-  ch    = idx;
-  field = off;
-  return true;
+// ===========================================================================
+// Modbus onSet callbacks
+// ===========================================================================
+uint16_t cbSetWatchdog(TRegister* reg, uint16_t val) {
+    feedWatchdog();
+    if (val >= Cfg::WD_MIN_MS && val <= Cfg::WD_MAX_MS) {
+        g_wdTimeoutMs = val; return val;
+    }
+    g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError);
+    return (uint16_t)g_wdTimeoutMs;
 }
 
+uint16_t cbSetTelemetry(TRegister* reg, uint16_t val) {
+    feedWatchdog(); g_telemMs = val; return val;
+}
+
+uint16_t cbSetCommand(TRegister* reg, uint16_t val) {
+    feedWatchdog();
+    switch (val) {
+        case 0: break;
+        case 1:
+            for (uint8_t i = 0; i < 3; i++) stopChannel(i, true);
+            // Disable callbacks while updating control registers to avoid triggering
+            // cbSetCHxMode from within cbSetCommand (cross-callback writes).
+            mb.cbDisable();
+            for (uint8_t i = 0; i < 3; i++) mb.Hreg(Reg::CH_MODE(i + 1), 0);
+            mb.cbEnable(true);
+            break;
+        case 2: case 3:
+            if (!interlockOk()) { g_lastError = 12; mb.Hreg(Reg::LAST_ERROR, g_lastError); }
+            else g_faultLatched = false;
+            break;
+        case 4:
+            applyPendingModes();
+            break;
+        default: break;
+    }
+    g_commandRegisterClearPending = (val != 0);
+    return val;
+}
+
+// Return g_ch[idx].requestedMode (may differ from val due to Pulse→PulseTrain elevation);
+// the library stores the callback return value — this is the ONLY safe way to
+// update the control register because mb.Hreg(CH_MODE, …) inside a callback
+// would re-trigger this same callback (infinite recursion).
+uint16_t cbSetCH1Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(0, val); return (uint16_t)g_ch[0].requestedMode; }
+uint16_t cbSetCH2Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(1, val); return (uint16_t)g_ch[1].requestedMode; }
+uint16_t cbSetCH3Mode(TRegister* reg, uint16_t val) { feedWatchdog(); handleModeWrite(2, val); return (uint16_t)g_ch[2].requestedMode; }
+
+uint16_t cbSetCH1PulseMs(TRegister* reg, uint16_t val) {
+    feedWatchdog();
+    if (val >= Cfg::PULSE_MS_MIN && val <= Cfg::PULSE_MS_MAX) { g_ch[0].pulseMs = val; return val; }
+    g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError); return (uint16_t)g_ch[0].pulseMs;
+}
+uint16_t cbSetCH2PulseMs(TRegister* reg, uint16_t val) {
+    feedWatchdog();
+    if (val >= Cfg::PULSE_MS_MIN && val <= Cfg::PULSE_MS_MAX) { g_ch[1].pulseMs = val; return val; }
+    g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError); return (uint16_t)g_ch[1].pulseMs;
+}
+uint16_t cbSetCH3PulseMs(TRegister* reg, uint16_t val) {
+    feedWatchdog();
+    if (val >= Cfg::PULSE_MS_MIN && val <= Cfg::PULSE_MS_MAX) { g_ch[2].pulseMs = val; return val; }
+    g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError); return (uint16_t)g_ch[2].pulseMs;
+}
+
+uint16_t cbSetCH1Count(TRegister* reg, uint16_t val) {
+    feedWatchdog();
+    if (val >= Cfg::COUNT_MIN && val <= Cfg::COUNT_MAX) { g_ch[0].count = val; return val; }
+    g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError); return (uint16_t)g_ch[0].count;
+}
+uint16_t cbSetCH2Count(TRegister* reg, uint16_t val) {
+    feedWatchdog();
+    if (val >= Cfg::COUNT_MIN && val <= Cfg::COUNT_MAX) { g_ch[1].count = val; return val; }
+    g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError); return (uint16_t)g_ch[1].count;
+}
+uint16_t cbSetCH3Count(TRegister* reg, uint16_t val) {
+    feedWatchdog();
+    if (val >= Cfg::COUNT_MIN && val <= Cfg::COUNT_MAX) { g_ch[2].count = val; return val; }
+    g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError); return (uint16_t)g_ch[2].count;
+}
+
+uint16_t cbSetCH1EnaToggle(TRegister* reg, uint16_t val) { feedWatchdog(); if (val == 1) triggerEnableToggle(0); return 0; }
+uint16_t cbSetCH2EnaToggle(TRegister* reg, uint16_t val) { feedWatchdog(); if (val == 1) triggerEnableToggle(1); return 0; }
+uint16_t cbSetCH3EnaToggle(TRegister* reg, uint16_t val) { feedWatchdog(); if (val == 1) triggerEnableToggle(2); return 0; }
+
 // ===========================================================================
-// Modbus register read / write
+// Modbus onGet callbacks (status registers -- live values)
 // ===========================================================================
+// Any read of SYS_STATE counts as a keep-alive: the GUI polls this register
+// every cycle, so it naturally feeds the SW watchdog via reads (FC03) as well
+// as via writes, matching the README intent ("any valid Modbus frame").
+uint16_t cbGetSysState    (TRegister* reg, uint16_t val) { feedWatchdog(); return (uint16_t)g_state; }
+uint16_t cbGetSysReason   (TRegister* reg, uint16_t val) { return (uint16_t)g_state; }
+uint16_t cbGetFaultLatched(TRegister* reg, uint16_t val) { return g_faultLatched ? 1 : 0; }
+uint16_t cbGetInterlockOk (TRegister* reg, uint16_t val) { return interlockOk()  ? 1 : 0; }
+uint16_t cbGetWatchdogOk  (TRegister* reg, uint16_t val) { return watchdogOk()   ? 1 : 0; }
+uint16_t cbGetLastError   (TRegister* reg, uint16_t val) {
+    uint16_t e = g_lastError; g_lastError = 0; mb.Hreg(Reg::LAST_ERROR, 0); return e;
+}
 
-static bool readHoldingRegister(uint16_t reg, uint16_t &out) {
-  switch (reg) {
-    case ModbusMap::REG_WATCHDOG_MS:
-      out = static_cast<uint16_t>(Runtime::watchdogTimeoutMs);       return true;
-    case ModbusMap::REG_TELEMETRY_MS:
-      out = static_cast<uint16_t>(Runtime::telemetryPeriodMs);       return true;
-    case ModbusMap::REG_COMMAND:
-      out = 0;                                                        return true;
-    case ModbusMap::REG_SYS_STATE:
-      out = topLevelStateToCode(evaluateTopLevelState());             return true;
-    case ModbusMap::REG_SYS_REASON:
-      out = topLevelReasonCode(evaluateTopLevelState());              return true;
-    case ModbusMap::REG_FAULT_LATCHED:
-      out = Runtime::faultLatched ? 1 : 0;                           return true;
-    case ModbusMap::REG_INTERLOCK_OK:
-      out = isInterlockSatisfied() ? 1 : 0;                          return true;
-    case ModbusMap::REG_WATCHDOG_OK:
-      out = isWatchdogHealthy() ? 1 : 0;                             return true;
-    case ModbusMap::REG_LAST_ERROR:
-      out = static_cast<uint16_t>(Runtime::lastModbusError);        return true;
-    default: break;
-  }
+static uint16_t liveChField(uint8_t idx, uint8_t field) {
+    Mode activeMode = Mode::Off;
+    uint32_t pulsesLeft = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        activeMode = g_ch[idx].mode;
+        pulsesLeft = g_ch[idx].pulsesLeft;
+    }
 
-  uint8_t ch = 0, field = 0;
-
-  if (decodeChannelControlRegister(reg, ch, field)) {
-    const Runtime::ChannelControl &c = Runtime::channels[ch];
     switch (field) {
-      case 0: out = modeToCode(c.mode);                        return true;
-      case 1: out = static_cast<uint16_t>(c.pulseDurationMs); return true;
-      case 2: out = static_cast<uint16_t>(c.pulseCount);      return true;
-      case 3: out = 0;                                         return true; // write-only
+        case 0: return (uint16_t)activeMode;
+        case 1: return (uint16_t)g_ch[idx].pulseMs;
+        case 2: return (uint16_t)g_ch[idx].count;
+        case 3: return (uint16_t)pulsesLeft;
+        case 4: case 5: case 6: case 7: return 0;  // not wired in HW rev 2026-03-17
+        case 8: return (digitalRead(Pins::GATE[idx]) == HIGH) ? 1 : 0;
+        default: return 0;
     }
-  }
-
-  if (decodeChannelStatusRegister(reg, ch, field)) {
-    const Runtime::ChannelControl &c = Runtime::channels[ch];
-    switch (field) {
-      case 0: out = modeToCode(c.mode);                                             return true;
-      case 1: out = static_cast<uint16_t>(c.pulseDurationMs);                      return true;
-      case 2: out = static_cast<uint16_t>(c.pulseCount);                           return true;
-      case 3: out = static_cast<uint16_t>(c.pulsesRemaining);                      return true;
-      case 4: out = activeLowRead(Config::ENABLE_STATUS_PINS[ch])      ? 1 : 0;    return true;
-      case 5: out = activeLowRead(Config::POWER_STATUS_PINS[ch])       ? 1 : 0;    return true;
-      case 6: out = activeLowRead(Config::OVERCURRENT_STATUS_PINS[ch]) ? 1 : 0;    return true;
-      case 7: out = activeLowRead(Config::GATED_STATUS_PINS[ch])       ? 1 : 0;    return true;
-      case 8: out = c.lastLevel                                         ? 1 : 0;    return true;
-      default: out = 0;                                                             return true;
-    }
-  }
-
-  // Any register address not covered above (gap addresses 3-9, 14-19, 24-29,
-  // or anything above the defined status blocks) returns 0 instead of causing
-  // the firmware to abort the entire batch read with an exception.  A single
-  // exception aborts ALL values in a multi-register read, which causes the
-  // Python driver to treat the whole poll cycle as a failure and eventually
-  // auto-disconnect.  Returning 0 for unused addresses is safe and keeps batch
-  // reads from wider address ranges working correctly.
-  out = 0;
-  return true;
 }
 
-static bool writeHoldingRegister(uint16_t reg, uint16_t value, uint8_t &exOut) {
-  exOut = 0x03;
+#define MAKE_CH_STAT_CALLBACKS(IDX)                                                \
+uint16_t cbGetCH##IDX##S0(TRegister* r, uint16_t v){ return liveChField(IDX-1,0);}\
+uint16_t cbGetCH##IDX##S1(TRegister* r, uint16_t v){ return liveChField(IDX-1,1);}\
+uint16_t cbGetCH##IDX##S2(TRegister* r, uint16_t v){ return liveChField(IDX-1,2);}\
+uint16_t cbGetCH##IDX##S3(TRegister* r, uint16_t v){ return liveChField(IDX-1,3);}\
+uint16_t cbGetCH##IDX##S4(TRegister* r, uint16_t v){ return liveChField(IDX-1,4);}\
+uint16_t cbGetCH##IDX##S5(TRegister* r, uint16_t v){ return liveChField(IDX-1,5);}\
+uint16_t cbGetCH##IDX##S6(TRegister* r, uint16_t v){ return liveChField(IDX-1,6);}\
+uint16_t cbGetCH##IDX##S7(TRegister* r, uint16_t v){ return liveChField(IDX-1,7);}\
+uint16_t cbGetCH##IDX##S8(TRegister* r, uint16_t v){ return liveChField(IDX-1,8);}
 
-  if (reg == ModbusMap::REG_WATCHDOG_MS) {
-    if (value < Config::HEARTBEAT_MIN_MS || value > Config::HEARTBEAT_MAX_MS) {
-      setModbusError(Runtime::ModbusError::IllegalValue); return false;
+MAKE_CH_STAT_CALLBACKS(1)
+MAKE_CH_STAT_CALLBACKS(2)
+MAKE_CH_STAT_CALLBACKS(3)
+
+// ===========================================================================
+// Modbus register setup
+// ===========================================================================
+static void modbusSetupRegisters() {
+    // System control
+    mb.addHreg(Reg::WATCHDOG_MS,  (uint16_t)Cfg::WD_DEFAULT_MS);
+    mb.addHreg(Reg::TELEMETRY_MS, (uint16_t)Cfg::WD_DEFAULT_MS);
+    mb.addHreg(Reg::COMMAND, 0);
+    mb.onSetHreg(Reg::WATCHDOG_MS,  cbSetWatchdog);
+    mb.onSetHreg(Reg::TELEMETRY_MS, cbSetTelemetry);
+    mb.onSetHreg(Reg::COMMAND,      cbSetCommand);
+
+    // Channel control
+    for (uint8_t ch = 1; ch <= 3; ch++) {
+        mb.addHreg(Reg::CH_MODE(ch),       0);
+        mb.addHreg(Reg::CH_PULSE_MS(ch),   10);
+        mb.addHreg(Reg::CH_COUNT(ch),      1);
+        mb.addHreg(Reg::CH_ENA_TOGGLE(ch), 0);
     }
-    Runtime::watchdogTimeoutMs = value;
-    setModbusError(Runtime::ModbusError::None); return true;
-  }
+    mb.onSetHreg(Reg::CH_MODE(1),       cbSetCH1Mode);
+    mb.onSetHreg(Reg::CH_MODE(2),       cbSetCH2Mode);
+    mb.onSetHreg(Reg::CH_MODE(3),       cbSetCH3Mode);
+    mb.onSetHreg(Reg::CH_PULSE_MS(1),   cbSetCH1PulseMs);
+    mb.onSetHreg(Reg::CH_PULSE_MS(2),   cbSetCH2PulseMs);
+    mb.onSetHreg(Reg::CH_PULSE_MS(3),   cbSetCH3PulseMs);
+    mb.onSetHreg(Reg::CH_COUNT(1),      cbSetCH1Count);
+    mb.onSetHreg(Reg::CH_COUNT(2),      cbSetCH2Count);
+    mb.onSetHreg(Reg::CH_COUNT(3),      cbSetCH3Count);
+    mb.onSetHreg(Reg::CH_ENA_TOGGLE(1), cbSetCH1EnaToggle);
+    mb.onSetHreg(Reg::CH_ENA_TOGGLE(2), cbSetCH2EnaToggle);
+    mb.onSetHreg(Reg::CH_ENA_TOGGLE(3), cbSetCH3EnaToggle);
 
-  if (reg == ModbusMap::REG_TELEMETRY_MS) {
-    Runtime::telemetryPeriodMs = value;
-    setModbusError(Runtime::ModbusError::None); return true;
-  }
+    // System status
+    mb.addHreg(Reg::SYS_STATE,     0);
+    mb.addHreg(Reg::SYS_REASON,    0);
+    mb.addHreg(Reg::FAULT_LATCHED, 0);
+    mb.addHreg(Reg::INTERLOCK_OK,  0);
+    mb.addHreg(Reg::WATCHDOG_OK,   0);
+    mb.addHreg(Reg::LAST_ERROR,    0);
+    mb.onGetHreg(Reg::SYS_STATE,     cbGetSysState);
+    mb.onGetHreg(Reg::SYS_REASON,    cbGetSysReason);
+    mb.onGetHreg(Reg::FAULT_LATCHED, cbGetFaultLatched);
+    mb.onGetHreg(Reg::INTERLOCK_OK,  cbGetInterlockOk);
+    mb.onGetHreg(Reg::WATCHDOG_OK,   cbGetWatchdogOk);
+    mb.onGetHreg(Reg::LAST_ERROR,    cbGetLastError);
 
-  if (reg == ModbusMap::REG_COMMAND) {
-    if (value == 0) { setModbusError(Runtime::ModbusError::None); return true; }
-    if (value == 1) {
-      for (uint8_t ch = 0; ch < Config::CHANNEL_COUNT; ++ch) setChannelOff(ch);
-      setModbusError(Runtime::ModbusError::None); return true;
+    // Per-channel status
+    typedef uint16_t (*CbFn)(TRegister*, uint16_t);
+    static const CbFn ch1cbs[9] = {
+        cbGetCH1S0, cbGetCH1S1, cbGetCH1S2, cbGetCH1S3,
+        cbGetCH1S4, cbGetCH1S5, cbGetCH1S6, cbGetCH1S7, cbGetCH1S8 };
+    static const CbFn ch2cbs[9] = {
+        cbGetCH2S0, cbGetCH2S1, cbGetCH2S2, cbGetCH2S3,
+        cbGetCH2S4, cbGetCH2S5, cbGetCH2S6, cbGetCH2S7, cbGetCH2S8 };
+    static const CbFn ch3cbs[9] = {
+        cbGetCH3S0, cbGetCH3S1, cbGetCH3S2, cbGetCH3S3,
+        cbGetCH3S4, cbGetCH3S5, cbGetCH3S6, cbGetCH3S7, cbGetCH3S8 };
+
+    for (uint8_t f = 0; f < 9; f++) {
+        mb.addHreg(Reg::CH_STAT_BASE(1) + f, 0);
+        mb.addHreg(Reg::CH_STAT_BASE(2) + f, 0);
+        mb.addHreg(Reg::CH_STAT_BASE(3) + f, 0);
+        mb.onGetHreg(Reg::CH_STAT_BASE(1) + f, ch1cbs[f]);
+        mb.onGetHreg(Reg::CH_STAT_BASE(2) + f, ch2cbs[f]);
+        mb.onGetHreg(Reg::CH_STAT_BASE(3) + f, ch3cbs[f]);
     }
-    if (value == 2 || value == 3) {
-      if (isAnyOverCurrentAsserted()) {
-        setModbusError(Runtime::ModbusError::FaultStillActive); exOut = 0x04; return false;
-      }
-      if (!isInterlockSatisfied()) {
-        setModbusError(Runtime::ModbusError::InterlockNotReady); exOut = 0x04; return false;
-      }
-      Runtime::faultLatched = false;
-      setModbusError(Runtime::ModbusError::None); return true;
-    }
-    setModbusError(Runtime::ModbusError::IllegalValue); return false;
-  }
-
-  uint8_t ch = 0, field = 0;
-  if (!decodeChannelControlRegister(reg, ch, field)) {
-    setModbusError(Runtime::ModbusError::IllegalAddress); exOut = 0x02; return false;
-  }
-
-  Runtime::ChannelControl &c = Runtime::channels[ch];
-
-  if (field == 1) {
-    if (value < Config::PULSE_DURATION_MIN_MS || value > Config::PULSE_DURATION_MAX_MS) {
-      setModbusError(Runtime::ModbusError::IllegalValue); return false;
-    }
-    c.pulseDurationMs = value;
-    setModbusError(Runtime::ModbusError::None); return true;
-  }
-
-  if (field == 2) {
-    if (value < Config::PULSE_COUNT_MIN || value > Config::PULSE_COUNT_MAX) {
-      setModbusError(Runtime::ModbusError::IllegalValue); return false;
-    }
-    c.pulseCount = value;
-    setModbusError(Runtime::ModbusError::None); return true;
-  }
-
-  if (field == 3) {
-    if (value != 1) { setModbusError(Runtime::ModbusError::IllegalValue); return false; }
-    pulseEnableToggle(ch);
-    setModbusError(Runtime::ModbusError::None); return true;
-  }
-
-  if (field == 0) {
-    const Runtime::TopLevelState state = evaluateTopLevelState();
-
-    if (value == 0) {
-      setChannelOff(ch);
-      setModbusError(Runtime::ModbusError::None); return true;
-    }
-    if (state != Runtime::TopLevelState::Ready) {
-      setModbusError(Runtime::ModbusError::NotReady); exOut = 0x04; return false;
-    }
-    if (value == 1) {
-      if (!activeLowRead(Config::ENABLE_STATUS_PINS[ch])) pulseEnableToggle(ch);
-      setChannelDC(ch);
-      setModbusError(Runtime::ModbusError::None); return true;
-    }
-    if (value == 2) {
-      if (!activeLowRead(Config::ENABLE_STATUS_PINS[ch])) pulseEnableToggle(ch);
-      if (c.pulseCount <= 1) setChannelPulse(ch, c.pulseDurationMs);
-      else                   setChannelPulseTrain(ch, c.pulseDurationMs, c.pulseCount);
-      setModbusError(Runtime::ModbusError::None); return true;
-    }
-    if (value == 3) {
-      if (c.pulseCount < 2) { setModbusError(Runtime::ModbusError::IllegalValue); return false; }
-      if (!activeLowRead(Config::ENABLE_STATUS_PINS[ch])) pulseEnableToggle(ch);
-      setChannelPulseTrain(ch, c.pulseDurationMs, c.pulseCount);
-      setModbusError(Runtime::ModbusError::None); return true;
-    }
-    setModbusError(Runtime::ModbusError::IllegalValue); return false;
-  }
-
-  setModbusError(Runtime::ModbusError::IllegalAddress); exOut = 0x02; return false;
 }
 
 // ===========================================================================
-// Modbus RTU framing  –  CRC-16, send, receive, dispatch
+// LCD helpers
 // ===========================================================================
+#if BCON_ENABLE_LCD
 
-static uint16_t modbusCrc16(const uint8_t *data, size_t len) {
-  uint16_t crc = 0xFFFF;
-  for (size_t i = 0; i < len; ++i) {
-    crc ^= data[i];
-    for (uint8_t b = 0; b < 8; ++b)
-      crc = (crc & 1) ? ((crc >> 1) ^ 0xA001) : (crc >> 1);
-  }
-  return crc;
+static const char* modeAbbrev(Mode m) {
+    switch (m) {
+        case Mode::Off:        return "OFF";
+        case Mode::DC:         return "DC ";
+        case Mode::Pulse:      return "PUL";
+        case Mode::PulseTrain: return "TRN";
+    }
+    return "???";
 }
 
-static void modbusSendFrame(const uint8_t *payload, size_t payloadLen) {
-  uint8_t frame[260];
-  if (payloadLen + 2 > sizeof(frame)) return;
-
-  memcpy(frame, payload, payloadLen);
-  const uint16_t crc    = modbusCrc16(payload, payloadLen);
-  frame[payloadLen]     = static_cast<uint8_t>(crc & 0xFF);
-  frame[payloadLen + 1] = static_cast<uint8_t>((crc >> 8) & 0xFF);
-
-  rs485SetTransmit(true);
-  Config::RS485_SERIAL.write(frame, payloadLen + 2);
-  Config::RS485_SERIAL.flush();
-  rs485SetTransmit(false);
+static bool lcdProbe(uint8_t addr) {
+    Wire.beginTransmission(addr);
+    return (Wire.endTransmission() == 0);
 }
 
-static void modbusSendException(uint8_t slaveId, uint8_t fc, uint8_t exCode) {
-  const uint8_t payload[3] = {slaveId, static_cast<uint8_t>(fc | 0x80), exCode};
-  modbusSendFrame(payload, 3);
+static void lcdInit() {
+    uint8_t addr = 0;
+    if      (lcdProbe(Cfg::LCD_ADDR_PRIMARY))  addr = Cfg::LCD_ADDR_PRIMARY;
+    else if (lcdProbe(Cfg::LCD_ADDR_FALLBACK)) addr = Cfg::LCD_ADDR_FALLBACK;
+    else return;
+
+    g_lcd = new LiquidCrystal_I2C(addr, Cfg::LCD_COLS, Cfg::LCD_ROWS);
+    g_lcd->begin(Cfg::LCD_COLS, Cfg::LCD_ROWS);
+    g_lcd->backlight();
+    g_lcd->clear();
+
+    memset(g_lcdBuf,  ' ', sizeof(g_lcdBuf));
+    memset(g_lcdLast, ' ', sizeof(g_lcdLast));
+    for (uint8_t r = 0; r < Cfg::LCD_ROWS; r++) {
+        g_lcdBuf[r][Cfg::LCD_COLS]  = '\0';
+        g_lcdLast[r][Cfg::LCD_COLS] = '\0';
+    }
 }
 
-static void processModbusFrame(const uint8_t *frame, size_t len) {
-  if (len < 4) return;
+static void lcdUpdate() {
+    if (!g_lcd) return;
+    uint32_t now = millis();
+    // Defer if a serial byte arrived recently (I2C / RS-485 noise guard)
+    if ((now - g_lastSerialByteMs) < Cfg::LCD_SERIAL_DEFER_MS) return;
+    if ((now - g_lcdLastRefreshMs) < Cfg::LCD_REFRESH_MS)      return;
+    g_lcdLastRefreshMs = now;
 
-  const uint8_t slaveId     = frame[0];
-  const bool    isBroadcast = (slaveId == 0);
-  if (!isBroadcast && slaveId != Config::MODBUS_SLAVE_ID) return;
+    // Build row 0: system status
+    snprintf(g_lcdBuf[0], Cfg::LCD_COLS + 1,
+             "WDG:%-2s INT:%-2s FLT:%d  ",
+             watchdogOk()  ? "OK" : "NO",
+             interlockOk() ? "OK" : "NO",
+             (int)g_faultLatched);
 
-  const uint16_t rxCrc  = static_cast<uint16_t>(frame[len - 2]) |
-                          static_cast<uint16_t>(frame[len - 1] << 8);
-  const uint16_t calcCrc = modbusCrc16(frame, len - 2);
-  if (rxCrc != calcCrc) return;
+    // Rows 1-3: per channel
+    for (uint8_t i = 0; i < 3; i++) {
+        Mode activeMode = Mode::Off;
+        uint32_t pulsesLeft = 0;
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            activeMode = g_ch[i].mode;
+            pulsesLeft = g_ch[i].pulsesLeft;
+        }
+        snprintf(g_lcdBuf[i + 1], Cfg::LCD_COLS + 1,
+                 "CH%d %s O:%d R:%-5u   ",
+                 i + 1,
+                 modeAbbrev(activeMode),
+                 (digitalRead(Pins::GATE[i]) == HIGH) ? 1 : 0,
+                 (unsigned int)(pulsesLeft & 0xFFFFu));
+    }
 
-  // Any valid frame resets the software watchdog
-  Runtime::lastCommandMillis = millis();
-
-  const uint8_t fc = frame[1];
-
-  // --- FC 0x03: Read Holding Registers ---
-  if (fc == 0x03) {
-    if (len != 8) {
-      if (!isBroadcast) modbusSendException(slaveId, fc, 0x03);
-      setModbusError(Runtime::ModbusError::IllegalValue); return;
+    // Write only changed rows; disable TWI between writes to reduce I2C noise
+    for (uint8_t r = 0; r < Cfg::LCD_ROWS; r++) {
+        if (memcmp(g_lcdBuf[r], g_lcdLast[r], Cfg::LCD_COLS) != 0) {
+            TWCR = 0;           // disable TWI hardware
+            Wire.begin();
+            Wire.setClock(400000);
+            g_lcd->setCursor(0, r);
+            g_lcd->print(g_lcdBuf[r]);
+            memcpy(g_lcdLast[r], g_lcdBuf[r], Cfg::LCD_COLS + 1);
+            TWCR = 0;           // disable again until next write
+        }
     }
-    const uint16_t startReg = static_cast<uint16_t>((frame[2] << 8) | frame[3]);
-    const uint16_t quantity = static_cast<uint16_t>((frame[4] << 8) | frame[5]);
-    if (quantity == 0 || quantity > 125) {
-      if (!isBroadcast) modbusSendException(slaveId, fc, 0x03);
-      setModbusError(Runtime::ModbusError::IllegalValue); return;
-    }
-    uint8_t payload[260];
-    payload[0] = slaveId;
-    payload[1] = fc;
-    payload[2] = static_cast<uint8_t>(quantity * 2);
-    for (uint16_t i = 0; i < quantity; ++i) {
-      uint16_t val = 0;
-      if (!readHoldingRegister(static_cast<uint16_t>(startReg + i), val)) {
-        if (!isBroadcast) modbusSendException(slaveId, fc, 0x02);
-        setModbusError(Runtime::ModbusError::IllegalAddress); return;
-      }
-      payload[3 + i * 2] = static_cast<uint8_t>((val >> 8) & 0xFF);
-      payload[4 + i * 2] = static_cast<uint8_t>(val & 0xFF);
-    }
-    if (!isBroadcast) modbusSendFrame(payload, static_cast<size_t>(3 + quantity * 2));
-    setModbusError(Runtime::ModbusError::None); return;
-  }
-
-  // --- FC 0x06: Write Single Register ---
-  if (fc == 0x06) {
-    if (len != 8) {
-      if (!isBroadcast) modbusSendException(slaveId, fc, 0x03);
-      setModbusError(Runtime::ModbusError::IllegalValue); return;
-    }
-    const uint16_t reg   = static_cast<uint16_t>((frame[2] << 8) | frame[3]);
-    const uint16_t value = static_cast<uint16_t>((frame[4] << 8) | frame[5]);
-    uint8_t exCode = 0x03;
-    if (!writeHoldingRegister(reg, value, exCode)) {
-      if (!isBroadcast) modbusSendException(slaveId, fc, exCode); return;
-    }
-    if (!isBroadcast) modbusSendFrame(frame, 6);
-    return;
-  }
-
-  // --- FC 0x10: Write Multiple Registers ---
-  if (fc == 0x10) {
-    if (len < 11) {
-      if (!isBroadcast) modbusSendException(slaveId, fc, 0x03);
-      setModbusError(Runtime::ModbusError::IllegalValue); return;
-    }
-    const uint16_t startReg  = static_cast<uint16_t>((frame[2] << 8) | frame[3]);
-    const uint16_t quantity  = static_cast<uint16_t>((frame[4] << 8) | frame[5]);
-    const uint8_t  byteCount = frame[6];
-    if (quantity == 0 || quantity > 123 || byteCount != quantity * 2 ||
-        len != static_cast<size_t>(9 + byteCount)) {
-      if (!isBroadcast) modbusSendException(slaveId, fc, 0x03);
-      setModbusError(Runtime::ModbusError::IllegalValue); return;
-    }
-    for (uint16_t i = 0; i < quantity; ++i) {
-      const size_t   off   = 7 + i * 2;
-      const uint16_t value = static_cast<uint16_t>((frame[off] << 8) | frame[off + 1]);
-      uint8_t exCode = 0x03;
-      if (!writeHoldingRegister(static_cast<uint16_t>(startReg + i), value, exCode)) {
-        if (!isBroadcast) modbusSendException(slaveId, fc, exCode); return;
-      }
-    }
-    if (!isBroadcast) {
-      uint8_t payload[6] = {
-        slaveId, fc,
-        static_cast<uint8_t>((startReg >> 8) & 0xFF),
-        static_cast<uint8_t>(startReg & 0xFF),
-        static_cast<uint8_t>((quantity >> 8) & 0xFF),
-        static_cast<uint8_t>(quantity & 0xFF)
-      };
-      modbusSendFrame(payload, 6);
-    }
-    return;
-  }
-
-  // --- Unsupported function code ---
-  if (!isBroadcast) modbusSendException(slaveId, fc, 0x01);
-  setModbusError(Runtime::ModbusError::IllegalFunction);
 }
-
-static void pollModbus() {
-  while (Config::RS485_SERIAL.available() > 0) {
-    const int raw = Config::RS485_SERIAL.read();
-    if (raw < 0) break;
-    if (Runtime::modbusRxIndex < Config::MODBUS_RX_BUFFER_SIZE) {
-      Runtime::modbusRxBuffer[Runtime::modbusRxIndex++] = static_cast<uint8_t>(raw);
-      Runtime::lastModbusByteMillis = millis();
-    } else {
-      Runtime::modbusRxIndex = 0;
-      setModbusError(Runtime::ModbusError::BufferOverflow);
-    }
-  }
-
-  if (Runtime::modbusRxIndex > 0) {
-    const uint32_t now = millis();
-    if ((now - Runtime::lastModbusByteMillis) >= Config::MODBUS_FRAME_GAP_MS) {
-      processModbusFrame(Runtime::modbusRxBuffer, Runtime::modbusRxIndex);
-      Runtime::modbusRxIndex = 0;
-    }
-  }
-}
+#endif // BCON_ENABLE_LCD
 
 // ===========================================================================
-// LCD display subsystem
+// setup()
 // ===========================================================================
-namespace LcdDisplay {
-
-#if BCON_ENABLE_I2C_LCD
-
-LiquidCrystal_I2C lcdPrimary (Config::LCD_I2C_ADDRESS,          Config::LCD_COLS, Config::LCD_ROWS);
-LiquidCrystal_I2C lcdFallback(Config::LCD_I2C_ADDRESS_FALLBACK, Config::LCD_COLS, Config::LCD_ROWS);
-LiquidCrystal_I2C *lcd = &lcdPrimary;
-
-bool lcdInitialized = false;
-char lineCache[Config::LCD_ROWS][Config::LCD_COLS + 1] = {{0}};
-
-static bool i2cAddressPresent(uint8_t address) {
-  Wire.beginTransmission(address);
-  return (Wire.endTransmission() == 0);
-}
-
-// Write a padded row, skipping if content is unchanged (reduces I2C traffic)
-static void writeRow(uint8_t row, const char *text) {
-  if (!lcdInitialized || row >= Config::LCD_ROWS || text == nullptr) return;
-
-  char padded[Config::LCD_COLS + 1];
-  memset(padded, ' ', Config::LCD_COLS);
-  padded[Config::LCD_COLS] = '\0';
-
-  const size_t textLen = strlen(text);
-  const size_t copyLen = (textLen < Config::LCD_COLS) ? textLen : Config::LCD_COLS;
-  memcpy(padded, text, copyLen);
-
-  if (memcmp(lineCache[row], padded, Config::LCD_COLS) == 0) return;
-
-  memcpy(lineCache[row], padded, Config::LCD_COLS + 1);
-  lcd->setCursor(0, row);
-  lcd->print(padded);
-}
-
-#endif // BCON_ENABLE_I2C_LCD
-
-void begin() {
-#if BCON_ENABLE_I2C_LCD
-  if (!Config::ENABLE_DEBUG_LCD) return;
-
-  // Manually recover the I2C bus in case a previous crash left SDA held low.
-  // Bit-bang 9 SCL clocks with SDA released so the slave releases the bus.
-  pinMode(20, INPUT_PULLUP);   // SDA
-  pinMode(21, OUTPUT);         // SCL
-  for (uint8_t i = 0; i < 9; ++i) {
-    digitalWrite(21, LOW);  delayMicroseconds(5);
-    digitalWrite(21, HIGH); delayMicroseconds(5);
-  }
-  pinMode(21, INPUT_PULLUP);   // release SCL back to open-drain before Wire takes over
-  delayMicroseconds(10);
-
-  Wire.begin();
-#if defined(WIRE_HAS_TIMEOUT) || !defined(__AVR__)
-  Wire.setWireTimeout(3000, true);  // 3 ms timeout; auto-reset bus on hang
-#endif
-  // Allow the I2C backpack power rail, oscillator, and HD44780 controller
-  // to complete their power-on reset before we send any commands.
-  // HD44780 datasheet requires >40 ms after VCC > 2.7 V.
-  delay(50);
-
-  // Auto-detect I2C address: 0x27 (PCF8574) or 0x3F (PCF8574A)
-  if (i2cAddressPresent(Config::LCD_I2C_ADDRESS)) {
-    lcd = &lcdPrimary;
-  } else if (i2cAddressPresent(Config::LCD_I2C_ADDRESS_FALLBACK)) {
-    lcd = &lcdFallback;
-  } else {
-    lcdInitialized = false;
-    return; // no LCD found – continue silently
-  }
-
-  // Call init() twice: the first puts the HD44780 into 4-bit mode,
-  // the second performs the full function-set / display-on sequence.
-  // Some PCF8574 backpack variants require this double-init.
-  lcd->init();
-  delay(5);
-  lcd->init();
-
-  lcd->backlight();
-  lcd->clear();
-  delay(2); // clear command needs >1.52 ms to execute on the HD44780
-
-  memset(lineCache, 0, sizeof(lineCache));
-  lcdInitialized = true;
-
-  writeRow(0, "BCON Pulser v2");
-  writeRow(1, "Booting...");
-  writeRow(2, "");
-  writeRow(3, "");
-
-  armLcdTimer(Config::LCD_REFRESH_MS);
-#endif
-}
-
-
-
-
-void update() {
-#if BCON_ENABLE_I2C_LCD
-  if (!Config::ENABLE_DEBUG_LCD || !lcdInitialized) return;
-  if (!consumeLcdTimerEvent()) return;
-
-  // When Modbus is active, do ABSOLUTELY NO I2C.
-  // Even a single I2C write to the PCF8574 LCD backpack blocks loop() long
-  // enough to overflow the UART FIFO and corrupt Modbus frames.  The
-  // dashboard shows all status info; the LCD just keeps whatever was last
-  // displayed before the host connected.
-  //
-  // CRITICAL: We also DISABLE the TWI hardware peripheral while Modbus is
-  // active.  The enabled TWI interrupt can interpret electrical noise on the
-  // I2C bus (caused by USB serial traffic) as valid I2C events, generating
-  // spurious writes that corrupt the PCF8574 output register and kill the
-  // backlight.  Every ~2 s we briefly re-enable TWI to send a single
-  // backlight-reassert byte (~180 μs, safe for the 64-byte UART FIFO).
-  //
-  // Detect Modbus activity two ways:
-  //   1. Any valid Modbus frame received in the last 5 seconds
-  //   2. Watchdog healthy after boot grace (steady-state connection)
-  const uint32_t now = millis();
-  const bool hostPolling = (now - Runtime::lastCommandMillis) < 5000 &&
-                           Runtime::lastCommandMillis > 0;
-  const bool modbusActive = hostPolling ||
-                            (isWatchdogHealthy() && now > Runtime::watchdogGraceDeadlineMs);
-
-  static bool twiDisabled = false;
-  static uint32_t lastBacklightMs = 0;
-
-  if (modbusActive) {
-    if (!twiDisabled) {
-      // Shut down the TWI peripheral entirely so noise can't trigger events
-      TWCR = 0;           // disable TWI control register (clears TWIE, TWEN)
-      twiDisabled = true;
-      lastBacklightMs = now;
-    }
-
-    // Every 2 s, briefly re-enable TWI, reassert the backlight, and shut
-    // TWI down again.  A single expanderWrite is ~180 μs — safe.
-    if (now - lastBacklightMs >= 2000) {
-      Wire.begin();                    // re-enable TWI
-      lcd->backlight();                // single I2C write: reassert backlight
-      TWCR = 0;                        // disable TWI again immediately
-      lastBacklightMs = now;
-    }
-
-    armLcdTimer(500);    // wake up frequently to check backlight timer
-    return;
-  }
-
-  // ---- Modbus idle: re-enable TWI if it was disabled ----
-  if (twiDisabled) {
-    Wire.begin();
-#if defined(WIRE_HAS_TIMEOUT) || !defined(__AVR__)
-    Wire.setWireTimeout(3000, true);
-#endif
-    lcd->backlight();    // ensure backlight is on after TWI re-enable
-    twiDisabled = false;
-  }
-  armLcdTimer(Config::LCD_REFRESH_MS);
-
-  // Row 0: system health
-  char row0[Config::LCD_COLS + 1];
-  snprintf(row0, sizeof(row0), "%s:%s %s:%s %s:%u",
-    Config::LCD_LABEL_WATCHDOG,  isWatchdogHealthy()    ? "OK" : "NO",
-    Config::LCD_LABEL_INTERLOCK, isInterlockSatisfied() ? "OK" : "NO",
-    Config::LCD_LABEL_FAULT,     Runtime::faultLatched  ? 1 : 0);
-  writeRow(0, row0);
-
-  // Rows 1–3: per-channel status
-  for (uint8_t ch = 0; ch < Config::CHANNEL_COUNT && (ch + 1) < Config::LCD_ROWS; ++ch) {
-    const Runtime::ChannelControl &c = Runtime::channels[ch];
-    char row[Config::LCD_COLS + 1];
-    snprintf(row, sizeof(row), "%s %s O:%u R:%lu",
-      Config::LCD_LABEL_CHANNELS[ch],
-      modeToShortString(c.mode),
-      c.lastLevel ? 1 : 0,
-      static_cast<unsigned long>(c.pulsesRemaining));
-    writeRow(ch + 1, row);
-  }
-#endif
-}
-
-} // namespace LcdDisplay
-
-// ===========================================================================
-// Arduino entry points
-// ===========================================================================
-
 void setup() {
-  // The hardware WDT is enabled at the END of setup() to avoid timeout during
-  // long init sequences (USB serial enumeration, I2C scan, LCD init).
-  // The .init3 hook already disabled WDT early in the boot sequence.
-  wdt_disable();
+    g_bootMs = millis();
 
-  if (!Config::USE_USB_SERIAL) {
-    pinMode(Config::RS485_DE_RE_PIN, OUTPUT);
-    rs485SetTransmit(false);
-  }
+    // GPIO
+    for (uint8_t i = 0; i < 3; i++) {
+        pinMode(Pins::GATE[i], OUTPUT); digitalWrite(Pins::GATE[i], LOW);
+        pinMode(Pins::LED[i],  OUTPUT); digitalWrite(Pins::LED[i],  LOW);
+        pinMode(Pins::ENA[i],  OUTPUT); digitalWrite(Pins::ENA[i],  LOW);
+    }
+    pinMode(Pins::INTERLOCK, INPUT);  // external circuit provides signal; no pull-up
+    timerHardwareInit();
 
-  Config::RS485_SERIAL.begin(Config::RS485_BAUD);
-  // Drain any garbage that accumulated in the UART buffer during reset
-  while (Config::RS485_SERIAL.available()) Config::RS485_SERIAL.read();
+    // Modbus
+#if BCON_USE_USB_SERIAL
+    Serial.begin(Cfg::BAUD, SERIAL_8N1);
+    mb.begin(&Serial);
+#else
+    Serial1.begin(Cfg::BAUD, SERIAL_8N1);
+    mb.begin(&Serial1, Pins::RS485_DE_RE);
+    mb.setBaudrate(Cfg::BAUD);
+#endif
+    mb.slave(Cfg::SLAVE_ID);
+    modbusSetupRegisters();
 
-  pinMode(Config::KB_INTERLOCK_PIN,
-          Config::INTERLOCK_USE_PULLUP ? INPUT_PULLUP : INPUT);
+    // LCD
+#if BCON_ENABLE_LCD
+    Wire.begin();
+    Wire.setClock(400000);
+    lcdInit();
+#endif
 
-  // Pulse-gate outputs and enable-toggle outputs
-  for (uint8_t ch = 0; ch < Config::CHANNEL_COUNT; ++ch) {
-    pinMode(Config::PULSER_GATE_OUTPUT_PINS[ch], OUTPUT);
-    digitalWrite(Config::PULSER_GATE_OUTPUT_PINS[ch], LOW);
+    // SW watchdog first feed
+    feedWatchdog();
 
-    pinMode(Config::PULSER_ENABLE_TOGGLE_OUTPUT_PINS[ch], OUTPUT);
-    digitalWrite(Config::PULSER_ENABLE_TOGGLE_OUTPUT_PINS[ch],
-                 Config::ENABLE_TOGGLE_ACTIVE_HIGH ? LOW : HIGH);
-
-    Runtime::channels[ch] = Runtime::ChannelControl(); // reset to defaults
-  }
-
-  // Status inputs
-  const uint8_t statusMode = Config::STATUS_USE_INTERNAL_PULLUPS ? INPUT_PULLUP : INPUT;
-  for (uint8_t ch = 0; ch < Config::CHANNEL_COUNT; ++ch) {
-    pinMode(Config::ENABLE_STATUS_PINS[ch],      statusMode);
-    pinMode(Config::POWER_STATUS_PINS[ch],       statusMode);
-    pinMode(Config::OVERCURRENT_STATUS_PINS[ch], statusMode);
-    pinMode(Config::GATED_STATUS_PINS[ch],       statusMode);
-  }
-
-  // Initialize SW watchdog timestamps
-  Runtime::lastCommandMillis       = millis();
-  Runtime::watchdogGraceDeadlineMs = Runtime::lastCommandMillis + Config::WATCHDOG_BOOT_GRACE_MS;
-  Runtime::lastModbusByteMillis    = 0;
-  Runtime::lastModbusError         = Runtime::ModbusError::None;
-
-  setupChannelTimers();
-  setupLcdTimer();
-
-  LcdDisplay::begin(); // Wire.begin() + address probe + lcd->init()
-
-  // Enable hardware watchdog only after all init is complete.
-  // loop() pets it every iteration.
-  wdt_enable(WDTO_8S);
-  wdt_reset();
+    // Hardware WDT last (8 s)
+    wdt_enable(WDTO_8S);
 }
 
+// ===========================================================================
+// loop()
+// ===========================================================================
 void loop() {
-  wdt_reset(); // pet hardware WDT; stalls >8 s cause an MCU reset
+    wdt_reset();
 
-  serviceEnableToggleOutputs(); // deassert enable-toggle pins after pulse width
-  pollModbus();                 // receive + dispatch Modbus RTU frames
+    // Track last serial byte time for LCD deferral
+#if BCON_USE_USB_SERIAL
+    if (Serial.available()) g_lastSerialByteMs = millis();
+#else
+    if (Serial1.available()) g_lastSerialByteMs = millis();
+#endif
 
-  if (isAnyOverCurrentAsserted()) Runtime::faultLatched = true;
+    mb.task();
 
-  applyOutputs();       // drive gate pins per channel state-machines
-  LcdDisplay::update(); // redraw LCD if refresh timer fired
+    const TopState nextState = evaluateState();
+    if (g_state == TopState::Ready && nextState != TopState::Ready) {
+        handleSafetyTrip();
+    }
+    g_state = nextState;
+
+    if (g_state != TopState::Ready) {
+        forceAllOutputsLow();
+    } else {
+        applyDC();
+    }
+
+    tickEnableToggles();
+    syncDeferredRegisters();
+
+#if BCON_ENABLE_LCD
+    lcdUpdate();
+#endif
 }

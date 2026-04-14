@@ -4,7 +4,7 @@ Pulser Upper‑Machine GUI (Tkinter + Material-style with CustomTkinter)
 - Auto-scans serial ports (Linux) by default
 - Features implemented (first version):
   - Manual per-channel control (start/stop/single + parameter write)
-  - Synchronous start/stop via `SYNC_CMD` (mask + action)
+    - Synchronous start via staged mode writes + `COMMAND=4` apply
   - Safety / Remote-ARM register and physical enable input monitoring
   - Register viewer/editor (read/write holding registers)
   - Presets save/load (JSON)
@@ -56,6 +56,7 @@ TOTAL_REGS = 160
 REG_WATCHDOG_MS = 0
 REG_TELEMETRY_MS = 1
 REG_COMMAND = 2
+COMMAND_APPLY_STAGED_MODES = 4
 
 CH_BASE = [10, 20, 30]
 CH_MODE_OFF = 0
@@ -104,6 +105,8 @@ class ModbusManager(threading.Thread):
         self.last_regs = [0] * TOTAL_REGS
         self._poll_errors = 0          # consecutive poll failures
         self._MAX_POLL_ERRORS = 4      # tolerate this many before auto-disconnect
+        self._heartbeat_counter = 0    # counts poll cycles; triggers periodic NOP write
+        self._HEARTBEAT_EVERY = 3      # write NOP every N poll cycles (~0.9 s at 0.3 s interval)
 
     def connect(self, port, baud, unit, settle_s: float = 2.5):
         self.port = port
@@ -218,7 +221,21 @@ class ModbusManager(threading.Thread):
                     ok &= read_block(120, 9)     # CH2 status regs 120-128
                     ok &= read_block(130, 9)     # CH3 status regs 130-138
 
+                    if ok:
+                        # Periodic explicit NOP heartbeat write (COMMAND=0) so the
+                        # firmware SW watchdog is fed by a write frame even when the
+                        # operator makes no control changes.  Defense-in-depth on top
+                        # of the firmware feeding on SYS_STATE reads.
+                        self._heartbeat_counter += 1
+                        if self._heartbeat_counter >= self._HEARTBEAT_EVERY:
+                            self._heartbeat_counter = 0
+                            try:
+                                self._write_register_compat(REG_COMMAND, 0)  # NOP
+                            except Exception:
+                                pass  # non-fatal; read-based feed is still active
+
                     if not ok:
+                        self._heartbeat_counter = 0
                         self._poll_errors += 1
                         err = f"Modbus read failed ({self._poll_errors}/{self._MAX_POLL_ERRORS})"
                         if err != last_error_msg:
@@ -456,8 +473,10 @@ class PulserApp(ctk.CTk):
                       command=self._sync_write_params).pack(side="left", padx=4)
         ctk.CTkButton(btn_row, text="▶ Start Selected", width=120, fg_color="#2ecc71",
                       hover_color="#27ae60", command=self._sync_start).pack(side="left", padx=4)
-        ctk.CTkButton(btn_row, text="⏹ Stop All", width=100, fg_color="#e74c3c",
-                      hover_color="#c0392b", command=self._sync_stop_all).pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="⏹ Stop Selected", width=120, fg_color="#e67e22",
+                  hover_color="#ca6f1e", command=self._sync_stop_selected).pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="All Off", width=90, fg_color="#e74c3c",
+                  hover_color="#c0392b", command=self._sync_stop_all).pack(side="left", padx=4)
 
         # CSV Pulse Sequence player
         seq_frame = ctk.CTkFrame(left)
@@ -623,6 +642,7 @@ class PulserApp(ctk.CTk):
         self.modbus.enqueue_write(base + CH_COUNT_OFF, count)
         mode_code = MODE_LABEL_TO_CODE[mode_label]
         self.modbus.enqueue_write(base + CH_MODE_OFF, mode_code)
+        self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
         self._log_event(f"Applied CH{ch+1}: mode={mode_label} duration_ms={duration} count={count}")
 
     def _set_mode(self, ch, mode):
@@ -630,6 +650,7 @@ class PulserApp(ctk.CTk):
         if mode == MODE_PULSE:
             self.modbus.enqueue_write(base + CH_COUNT_OFF, 1)
         self.modbus.enqueue_write(base + CH_MODE_OFF, mode)
+        self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
         mode_name = {
             MODE_OFF: "OFF",
             MODE_DC: "DC",
@@ -671,8 +692,9 @@ class PulserApp(ctk.CTk):
 
         Strategy for minimising inter-channel start jitter:
           Phase 1 – write all duration/count values for every selected channel.
-          Phase 2 – write mode (start command) for every selected channel.
-        Both phases are enqueued atomically so no other write can interleave.
+                    Phase 2 – stage mode writes for every selected channel.
+                    Phase 3 – emit COMMAND=4 so firmware commits the staged modes together.
+                All phases are enqueued atomically so no other write can interleave.
         """
         selected = [ch for ch in range(3) if self.sync_ch_vars[ch].get()]
         if not selected:
@@ -707,9 +729,12 @@ class PulserApp(ctk.CTk):
                 self.modbus.enqueue_write(CH_BASE[ch] + CH_PULSE_MS_OFF, dur)
                 self.modbus.enqueue_write(CH_BASE[ch] + CH_COUNT_OFF, cnt)
 
-        # Phase 2: write mode for all channels — keeps mode writes as close together as possible
+        # Phase 2: stage modes for all channels
         for ch, (_, _, mode_code, _) in params.items():
             self.modbus.enqueue_write(CH_BASE[ch] + CH_MODE_OFF, mode_code)
+
+        # Phase 3: commit all staged mode changes together in firmware
+        self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
 
         self._log_event(
             "Sync Start: " +
@@ -719,11 +744,21 @@ class PulserApp(ctk.CTk):
             )
         )
 
-    def _sync_stop_all(self):
-        """Force all three channels to OFF immediately."""
-        for ch in range(3):
+    def _sync_stop_selected(self):
+        """Stage OFF for checked channels, then apply them together."""
+        selected = [ch for ch in range(3) if self.sync_ch_vars[ch].get()]
+        if not selected:
+            self._log_event("Sync Stop: no channels checked")
+            return
+        for ch in selected:
             self.modbus.enqueue_write(CH_BASE[ch] + CH_MODE_OFF, MODE_OFF)
-        self._log_event("Sync Stop: all channels \u2192 OFF")
+        self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
+        self._log_event(f"Sync Stop: CH{[c+1 for c in selected]} \u2192 OFF")
+
+    def _sync_stop_all(self):
+        """Immediate all-off command for emergency stop behavior."""
+        self.modbus.enqueue_write(REG_COMMAND, 1)
+        self._log_event("All Off: COMMAND=1")
 
     # ----------------------------- CSV Sequence player -----------------------------
 
@@ -851,11 +886,12 @@ class PulserApp(ctk.CTk):
                 self.modbus.enqueue_write(base + CH_PULSE_MS_OFF, row["duration_ms"])
                 self.modbus.enqueue_write(base + CH_COUNT_OFF, row["count"])
 
-            # Phase 2: write modes together to minimise inter-channel start jitter
+            # Phase 2: stage modes together, then commit them with one apply command
             for row in rows:
                 self.modbus.enqueue_write(
                     CH_BASE[row["ch"]] + CH_MODE_OFF, MODE_LABEL_TO_CODE[row["mode"]]
                 )
+            self.modbus.enqueue_write(REG_COMMAND, COMMAND_APPLY_STAGED_MODES)
 
             # Dwell in small slices so stop is responsive
             deadline = time.time() + dwell_ms / 1000.0
