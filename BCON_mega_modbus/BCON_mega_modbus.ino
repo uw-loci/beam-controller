@@ -28,7 +28,7 @@
 //    104  WATCHDOG_OK    1 if SW watchdog alive
 //    105  LAST_ERROR     last error code (auto-cleared on read)
 //    106  SUP_STATE      supervisor summary state
-//    107  CMD_QUEUE_DEPTH pending supervisor-command count
+//    107  CMD_QUEUE_DEPTH pending supervisor-command count (0 or 1)
 //    108  LAST_CMD_CODE  most recent supervisor command code
 //    109  LAST_CMD_RESULT 0=None 1=Queued 2=Executed 3=Rejected
 //
@@ -140,7 +140,9 @@ namespace Cfg {
 
     constexpr uint32_t LCD_REFRESH_MS         = 1000;
     constexpr uint32_t LCD_SERIAL_DEFER_MS    = 50;
-    constexpr uint8_t  COMMAND_QUEUE_LEN      = 8;
+    // Single in-flight command keeps host behavior deterministic while still
+    // routing execution through the supervisor/result-reporting path.
+    constexpr uint8_t  COMMAND_QUEUE_LEN      = 1;
 
     constexpr uint8_t  LCD_COLS               = 20;
     constexpr uint8_t  LCD_ROWS               = 4;
@@ -980,6 +982,9 @@ uint16_t cbSetTelemetry(TRegister* reg, uint16_t val) {
 uint16_t cbSetCommand(TRegister* reg, uint16_t val) {
     feedWatchdog();
     supervisorStageCommand(val);
+    // Drain immediately so staged host writes followed by COMMAND=4 keep the
+    // legacy 'apply now' behavior expected by pulser_test_gui.py.
+    supervisorProcessCommandMailbox();
     return val;
 }
 
