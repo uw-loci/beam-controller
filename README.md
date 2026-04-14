@@ -33,7 +33,7 @@ Working behaviors confirmed in the latest version:
 - staged `CHx_MODE` writes plus `COMMAND=4` apply remain functional
 - `COMMAND=1` all-off remains functional
 - watchdog/interlock safety still forces outputs low
-- the firmware now tracks ordered system commands through a FIFO mailbox
+- the firmware now stages system commands through a single-entry supervisor mailbox while preserving legacy apply-now behavior on `COMMAND` writes
 - additive supervisor state and command-result registers are exposed without breaking the legacy GUI register workflow
 
 ## Scope
@@ -60,7 +60,7 @@ The design intent is to keep exact pulse timing in the protected pulse engine an
 ```mermaid
 flowchart LR
     A[Dashboard / Modbus] --> B[Staged Registers]
-    A --> C[Ordered Command FIFO]
+    A --> C[Single-Entry Command Mailbox]
 
     B --> D[Supervisor]
     C --> D
@@ -85,17 +85,17 @@ flowchart LR
 
 ### 1. Command Flow
 
-The dashboard still writes staged parameters exactly as before. System commands are now queued and executed in-order by the supervisor in `loop()`.
+The dashboard still writes staged parameters exactly as before. `COMMAND` writes are normalized into a single-entry mailbox and then drained immediately so legacy hosts keep their existing `write COMMAND=4` -> apply-now behavior. `loop()` also drains the mailbox as a backstop.
 
 ```mermaid
 flowchart TD
     A[Modbus write arrives] --> B{Register type}
     B -->|CHx_MODE / CHx_PULSE_MS / CHx_COUNT| C[Stage requested values]
     B -->|COMMAND| D[Normalize command]
-    D --> E{Valid and queue space available?}
-    E -->|Yes| F[Push command into FIFO]
+    D --> E{Valid and mailbox space available?}
+    E -->|Yes| F[Push command into mailbox]
     E -->|No| G[Record rejected command result]
-    F --> H[Supervisor processes FIFO in loop]
+    F --> H[Drain mailbox immediately]
     H --> I{Command type}
     I -->|Apply| J[Apply staged modes if safe]
     I -->|All Off| K[Stop all channels]
@@ -105,13 +105,15 @@ flowchart TD
     L --> M
 ```
 
+After each accepted or rejected command, the firmware clears `COMMAND` back to `0`.
+
 ### 2. Safety Flow
 
 Outputs are only allowed while the top-level state is `Ready`.
 
 ```mermaid
 flowchart TD
-    A[loop()] --> B[Evaluate top state]
+    A[Main loop] --> B[Evaluate top-level state]
     B --> C{Interlock OK?}
     C -->|No| D[SafeInterlock]
     C -->|Yes| E{Watchdog OK?}
@@ -123,7 +125,7 @@ flowchart TD
     D --> J[Force outputs low]
     F --> J
     H --> J
-    I --> K[Allow DC hold + pulse engine activity]
+    I --> K[Allow DC hold and pulse engine activity]
 ```
 
 ### 3. Pulse Execution Boundary
@@ -156,6 +158,7 @@ Top-level safety states from [bcon_types.h](BCON_mega_modbus/bcon_types.h):
 
 Notes:
 - the software watchdog timeout is configurable through register `0` (`WATCHDOG_MS`)
+- the software watchdog is treated as healthy during the first `8000 ms` after boot (`WD_BOOT_GRACE_MS`)
 - the firmware also enables the AVR hardware watchdog to recover from local lockups
 - the interlock input is checked every loop and blocks new output activity when not asserted
 - in the current branch, DC channels are also cleared during a safety trip so they do not silently reassert after recovery without a fresh command
@@ -204,13 +207,15 @@ Current build-time options in [BCON_mega_modbus.ino](BCON_mega_modbus/BCON_mega_
 | `BCON_USE_USB_SERIAL` | `1` for USB serial bench mode, `0` for RS-485 production mode |
 | `BCON_ENABLE_LCD` | enable or disable the 20x4 I2C LCD |
 
+Current checked-in defaults on this branch: `BCON_USE_USB_SERIAL=1` and `BCON_ENABLE_LCD=1`.
+
 ### Control Registers
 
 | Address | Name | Notes |
 |---|---|---|
 | `0` | `WATCHDOG_MS` | software watchdog timeout |
 | `1` | `TELEMETRY_MS` | informational only |
-| `2` | `COMMAND` | queue supervisor commands |
+| `2` | `COMMAND` | single-entry supervisor mailbox; auto-clears to `0` after processing |
 | `10/20/30 +0` | `CHx_MODE` | staged requested mode |
 | `10/20/30 +1` | `CHx_PULSE_MS` | pulse duration |
 | `10/20/30 +2` | `CHx_COUNT` | pulse count |
@@ -222,7 +227,7 @@ Current build-time options in [BCON_mega_modbus.ino](BCON_mega_modbus/BCON_mega_
 |---|---|
 | `0` | NOP / heartbeat write |
 | `1` | all off |
-| `2` or `3` | clear fault |
+| `2` or `3` | clear fault if the interlock is closed |
 | `4` | apply staged modes |
 
 ### Legacy System Status Registers
@@ -245,7 +250,7 @@ These are additive and do not replace the legacy GUI-facing registers.
 | Address | Name | Meaning |
 |---|---|---|
 | `106` | `SUP_STATE` | overall supervisor summary state |
-| `107` | `CMD_QUEUE_DEPTH` | number of queued commands |
+| `107` | `CMD_QUEUE_DEPTH` | queued supervisor commands (`0` or `1` in the current build) |
 | `108` | `LAST_CMD_CODE` | most recent command code |
 | `109` | `LAST_CMD_RESULT` | `0=None 1=Queued 2=Executed 3=Rejected` |
 | `152` | `LAST_REJECT_REASON` | most recent reject reason |
@@ -301,8 +306,8 @@ The existing Python GUI workflow is intentionally preserved:
 5. optionally read `106-109` and `140-153` for richer supervisor telemetry
 
 Recommended heartbeat behavior:
-- continue polling `SYS_STATE`
-- or periodically write `COMMAND=0`
+- continue polling `SYS_STATE`; in the current firmware that read also feeds the software watchdog
+- `pulser_test_gui.py` currently also emits periodic `COMMAND=0` writes as defense in depth
 - do not rely on a long silent interval while expecting outputs to remain enabled
 
 ## Test Interfaces
@@ -323,7 +328,7 @@ A few things are intentionally still in transition:
 - the pulse engine is authoritative for exact timing, while the supervisor owns command ordering and semantic reporting
 - the overcurrent/fault-latch entry path is not yet fully implemented from live hardware fault inputs
 - channel status fields `+4` through `+7` are placeholders and currently return `0`
-- heartbeat semantics are still backward-compatible with existing GUI polling rather than fully migrated to a dedicated supervisor heartbeat command model
+- heartbeat semantics are still backward-compatible with existing GUI polling and periodic NOP writes rather than fully migrated to a dedicated supervisor heartbeat command model
 
 ## Development Guidance
 
