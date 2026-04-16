@@ -31,6 +31,7 @@ struct Channel {
     volatile uint32_t phaseRemainingTicks = 0;
     volatile bool     inHighPhase      = false;
     bool              modeApplyPending = false;
+    bool              enabled          = false;
 
     uint32_t enaToggleStartUs = 0;
     bool     enaToggleActive  = false;

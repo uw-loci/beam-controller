@@ -18,7 +18,7 @@
 //    base+0  MODE           staged requested mode (including Off); write COMMAND=4 to apply
 //    base+1  PULSE_MS       pulse duration ms (1-60000)
 //    base+2  COUNT          pulse count (1-10000)
-//    base+3  ENABLE_TOGGLE  write 1 = 100 ms enable-toggle pulse
+//    base+3  ENABLE_STATE   explicit enable request (0=disabled, 1=enabled)
 //
 //  System status (read-only):
 //    100  SYS_STATE      0=Ready 1=SafeInterlock 2=SafeWatchdog 3=FaultLatched
@@ -37,7 +37,7 @@
 //    +1  pulse_ms       configured pulse duration
 //    +2  count          configured pulse count
 //    +3  remaining      pulses remaining in current train
-//    +4  enable_status  (not wired in HW rev 2026-03-17 - always 0)
+//    +4  enable_status  firmware-latched channel enable state (0/1)
 //    +5  power_status   (not wired - always 0)
 //    +6  overcurrent    (not wired - always 0)
 //    +7  gated          (not wired - always 0)
@@ -163,7 +163,7 @@ namespace Reg {
     inline constexpr uint16_t CH_MODE(uint8_t ch)       { return CH_BASE(ch) + 0; }
     inline constexpr uint16_t CH_PULSE_MS(uint8_t ch)   { return CH_BASE(ch) + 1; }
     inline constexpr uint16_t CH_COUNT(uint8_t ch)      { return CH_BASE(ch) + 2; }
-    inline constexpr uint16_t CH_ENA_TOGGLE(uint8_t ch) { return CH_BASE(ch) + 3; }
+    inline constexpr uint16_t CH_ENABLE_STATE(uint8_t ch) { return CH_BASE(ch) + 3; }
 
     // System status
     constexpr uint16_t SYS_STATE     = 100;
@@ -219,6 +219,7 @@ static void supervisorRefreshAllChannelStates();
 static bool applyPendingModes();
 static void stopChannel(uint8_t idx, bool clearRequestedMode = true);
 static uint16_t supervisorChField(uint8_t idx, uint8_t field);
+static void setChannelEnabledState(uint8_t idx, bool enabled);
 
 // ===========================================================================
 // Global state
@@ -710,6 +711,14 @@ static void triggerEnableToggle(uint8_t idx) {
     digitalWrite(Pins::ENA[idx], HIGH);
 }
 
+static void setChannelEnabledState(uint8_t idx, bool enabled) {
+    Channel& c = g_ch[idx];
+    if (c.enabled == enabled) return;
+
+    c.enabled = enabled;
+    triggerEnableToggle(idx);
+}
+
 static void tickEnableToggles() {
     const uint32_t nowUs = micros();
     for (uint8_t idx = 0; idx < 3; idx++) {
@@ -1028,9 +1037,21 @@ uint16_t cbSetCH3Count(TRegister* reg, uint16_t val) {
     g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError); return (uint16_t)g_ch[2].count;
 }
 
-uint16_t cbSetCH1EnaToggle(TRegister* reg, uint16_t val) { feedWatchdog(); if (val == 1) triggerEnableToggle(0); return 0; }
-uint16_t cbSetCH2EnaToggle(TRegister* reg, uint16_t val) { feedWatchdog(); if (val == 1) triggerEnableToggle(1); return 0; }
-uint16_t cbSetCH3EnaToggle(TRegister* reg, uint16_t val) { feedWatchdog(); if (val == 1) triggerEnableToggle(2); return 0; }
+static uint16_t handleEnableStateWrite(uint8_t idx, uint16_t val) {
+    feedWatchdog();
+    if (val <= 1) {
+        setChannelEnabledState(idx, val != 0);
+        return g_ch[idx].enabled ? 1 : 0;
+    }
+
+    g_lastError = 3;
+    mb.Hreg(Reg::LAST_ERROR, g_lastError);
+    return g_ch[idx].enabled ? 1 : 0;
+}
+
+uint16_t cbSetCH1EnableState(TRegister* reg, uint16_t val) { return handleEnableStateWrite(0, val); }
+uint16_t cbSetCH2EnableState(TRegister* reg, uint16_t val) { return handleEnableStateWrite(1, val); }
+uint16_t cbSetCH3EnableState(TRegister* reg, uint16_t val) { return handleEnableStateWrite(2, val); }
 
 // ===========================================================================
 // Modbus onGet callbacks (status registers -- live values)
@@ -1066,7 +1087,8 @@ static uint16_t liveChField(uint8_t idx, uint8_t field) {
         case 1: return (uint16_t)g_ch[idx].pulseMs;
         case 2: return (uint16_t)g_ch[idx].count;
         case 3: return (uint16_t)pulsesLeft;
-        case 4: case 5: case 6: case 7: return 0;  // not wired in HW rev 2026-03-17
+        case 4: return g_ch[idx].enabled ? 1 : 0;
+        case 5: case 6: case 7: return 0;  // not wired in HW rev 2026-03-17
         case 8: return (digitalRead(Pins::GATE[idx]) == HIGH) ? 1 : 0;
         default: return 0;
     }
@@ -1124,7 +1146,7 @@ static void modbusSetupRegisters() {
         mb.addHreg(Reg::CH_MODE(ch),       0);
         mb.addHreg(Reg::CH_PULSE_MS(ch),   10);
         mb.addHreg(Reg::CH_COUNT(ch),      1);
-        mb.addHreg(Reg::CH_ENA_TOGGLE(ch), 0);
+        mb.addHreg(Reg::CH_ENABLE_STATE(ch), 0);
     }
     mb.onSetHreg(Reg::CH_MODE(1),       cbSetCH1Mode);
     mb.onSetHreg(Reg::CH_MODE(2),       cbSetCH2Mode);
@@ -1135,9 +1157,9 @@ static void modbusSetupRegisters() {
     mb.onSetHreg(Reg::CH_COUNT(1),      cbSetCH1Count);
     mb.onSetHreg(Reg::CH_COUNT(2),      cbSetCH2Count);
     mb.onSetHreg(Reg::CH_COUNT(3),      cbSetCH3Count);
-    mb.onSetHreg(Reg::CH_ENA_TOGGLE(1), cbSetCH1EnaToggle);
-    mb.onSetHreg(Reg::CH_ENA_TOGGLE(2), cbSetCH2EnaToggle);
-    mb.onSetHreg(Reg::CH_ENA_TOGGLE(3), cbSetCH3EnaToggle);
+    mb.onSetHreg(Reg::CH_ENABLE_STATE(1), cbSetCH1EnableState);
+    mb.onSetHreg(Reg::CH_ENABLE_STATE(2), cbSetCH2EnableState);
+    mb.onSetHreg(Reg::CH_ENABLE_STATE(3), cbSetCH3EnableState);
 
     // System status
     mb.addHreg(Reg::SYS_STATE,     0);
