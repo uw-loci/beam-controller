@@ -63,7 +63,7 @@
 // ---------------------------------------------------------------------------
 // Build-time options
 // ---------------------------------------------------------------------------
-#define BCON_USE_USB_SERIAL  1   // 0 = RS-485 (production), 1 = USB-CDC (bench)
+#define BCON_USE_USB_SERIAL  0   // 0 = RS-485 (production), 1 = USB-CDC (bench)
 #define BCON_ENABLE_LCD      1   // 1 = enable 20x4 I2C LCD
 
 // ---------------------------------------------------------------------------
@@ -241,6 +241,9 @@ static uint16_t g_lastCommandSeq = 0;
 static uint16_t g_lastCommandCode = 0;
 static CommandResultCode g_lastCommandResult = CommandResultCode::None;
 static RejectReason g_lastRejectReason = RejectReason::None;
+static bool     g_lastInterlockSample = false;
+static bool     g_lastWatchdogSample  = true;
+static bool     g_lcdRefreshPending   = false;
 
 // LCD row caches
 static char g_lcdBuf [Cfg::LCD_ROWS][Cfg::LCD_COLS + 1];
@@ -334,11 +337,15 @@ static uint32_t pulseDurationTicks(uint32_t pulseMs) {
     return pulseMs * Cfg::TIMER_TICKS_PER_MS;
 }
 
-static TopState evaluateState() {
-    if (!interlockOk())  return TopState::SafeInterlock;
-    if (!watchdogOk())   return TopState::SafeWatchdog;
+static TopState evaluateState(bool interlockIsOk, bool watchdogIsOk) {
+    if (!interlockIsOk)  return TopState::SafeInterlock;
+    if (!watchdogIsOk)   return TopState::SafeWatchdog;
     if (g_faultLatched)  return TopState::FaultLatched;
     return TopState::Ready;
+}
+
+static TopState evaluateState() {
+    return evaluateState(interlockOk(), watchdogOk());
 }
 
 static StopReason stopReasonForTopState(TopState state) {
@@ -1263,19 +1270,20 @@ static void lcdInit() {
     }
 }
 
-static void lcdUpdate() {
+static void lcdUpdate(bool interlockIsOk, bool watchdogIsOk, bool forceRefresh = false) {
     if (!g_lcd) return;
     uint32_t now = millis();
     // Defer if a serial byte arrived recently (I2C / RS-485 noise guard)
     if ((now - g_lastSerialByteMs) < Cfg::LCD_SERIAL_DEFER_MS) return;
-    if ((now - g_lcdLastRefreshMs) < Cfg::LCD_REFRESH_MS)      return;
+    if (!forceRefresh && (now - g_lcdLastRefreshMs) < Cfg::LCD_REFRESH_MS) return;
     g_lcdLastRefreshMs = now;
+    g_lcdRefreshPending = false;
 
     // Build row 0: system status
     snprintf(g_lcdBuf[0], Cfg::LCD_COLS + 1,
              "WDG:%-2s INT:%-2s FLT:%d  ",
-             watchdogOk()  ? "OK" : "NO",
-             interlockOk() ? "OK" : "NO",
+             watchdogIsOk  ? "OK" : "NO",
+             interlockIsOk ? "OK" : "NO",
              (int)g_faultLatched);
 
     // Rows 1-3: per channel
@@ -1349,6 +1357,8 @@ void setup() {
 
     // SW watchdog first feed
     feedWatchdog();
+    g_lastInterlockSample = interlockOk();
+    g_lastWatchdogSample = watchdogOk();
     supervisorRefreshAllChannelStates();
 
     // Hardware WDT last (8 s)
@@ -1371,7 +1381,17 @@ void loop() {
     mb.task();
     supervisorProcessCommandMailbox();
 
-    const TopState nextState = evaluateState();
+    const bool interlockIsOk = interlockOk();
+    const bool watchdogIsOk = watchdogOk();
+    if ((interlockIsOk != g_lastInterlockSample) ||
+        (watchdogIsOk != g_lastWatchdogSample)) {
+        g_lcdRefreshPending = true;
+    }
+
+    g_lastInterlockSample = interlockIsOk;
+    g_lastWatchdogSample = watchdogIsOk;
+
+    const TopState nextState = evaluateState(interlockIsOk, watchdogIsOk);
     if (g_state == TopState::Ready && nextState != TopState::Ready) {
         handleSafetyTrip();
     }
@@ -1388,6 +1408,6 @@ void loop() {
     supervisorRefreshAllChannelStates();
 
 #if BCON_ENABLE_LCD
-    lcdUpdate();
+    lcdUpdate(interlockIsOk, watchdogIsOk, g_lcdRefreshPending);
 #endif
 }
