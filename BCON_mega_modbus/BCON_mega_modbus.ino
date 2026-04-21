@@ -18,7 +18,7 @@
 //    base+0  MODE           staged requested mode (including Off); write COMMAND=4 to apply
 //    base+1  PULSE_MS       pulse duration ms (1-60000)
 //    base+2  COUNT          pulse count (1-10000)
-//    base+3  ENABLE_TOGGLE  write 1 = 100 ms enable-toggle pulse
+//    base+3  ENABLE_STATE   explicit enable request (0=disabled, 1=enabled)
 //
 //  System status (read-only):
 //    100  SYS_STATE      0=Ready 1=SafeInterlock 2=SafeWatchdog 3=FaultLatched
@@ -27,17 +27,29 @@
 //    103  INTERLOCK_OK   1 if arm-beams interlock asserted
 //    104  WATCHDOG_OK    1 if SW watchdog alive
 //    105  LAST_ERROR     last error code (auto-cleared on read)
+//    106  SUP_STATE      supervisor summary state
+//    107  CMD_QUEUE_DEPTH pending supervisor-command count (0 or 1)
+//    108  LAST_CMD_CODE  most recent supervisor command code
+//    109  LAST_CMD_RESULT 0=None 1=Queued 2=Executed 3=Rejected
 //
 //  Per-channel status  (base = 110 + (ch-1)*10, offsets 0-8):
 //    +0  mode           active output mode
 //    +1  pulse_ms       configured pulse duration
 //    +2  count          configured pulse count
 //    +3  remaining      pulses remaining in current train
-//    +4  enable_status  (not wired in HW rev 2026-03-17 - always 0)
+//    +4  enable_status  firmware-latched channel enable state (0/1)
 //    +5  power_status   (not wired - always 0)
 //    +6  overcurrent    (not wired - always 0)
 //    +7  gated          (not wired - always 0)
 //    +8  output_level   1 if gate pin currently HIGH
+//
+//  Supervisor extension status (read-only):
+//    140+(ch-1)*4 +0  CH_SUP_STATE    per-channel semantic state
+//    140+(ch-1)*4 +1  CH_STOP_REASON  most recent stop/abort reason
+//    140+(ch-1)*4 +2  CH_COMPLETE     1 if completion latched
+//    140+(ch-1)*4 +3  CH_ABORTED      1 if abort latched
+//    152  LAST_REJECT_REASON most recent command reject reason
+//    153  LAST_CMD_SEQ      most recent accepted command sequence
 // =============================================================================
 
 #include <Arduino.h>
@@ -51,7 +63,7 @@
 // ---------------------------------------------------------------------------
 // Build-time options
 // ---------------------------------------------------------------------------
-#define BCON_USE_USB_SERIAL  1   // 0 = RS-485 (production), 1 = USB-CDC (bench)
+#define BCON_USE_USB_SERIAL  0   // 0 = RS-485 (production), 1 = USB-CDC (bench)
 #define BCON_ENABLE_LCD      1   // 1 = enable 20x4 I2C LCD
 
 // ---------------------------------------------------------------------------
@@ -128,6 +140,9 @@ namespace Cfg {
 
     constexpr uint32_t LCD_REFRESH_MS         = 1000;
     constexpr uint32_t LCD_SERIAL_DEFER_MS    = 50;
+    // Single in-flight command keeps host behavior deterministic while still
+    // routing execution through the supervisor/result-reporting path.
+    constexpr uint8_t  COMMAND_QUEUE_LEN      = 1;
 
     constexpr uint8_t  LCD_COLS               = 20;
     constexpr uint8_t  LCD_ROWS               = 4;
@@ -148,7 +163,7 @@ namespace Reg {
     inline constexpr uint16_t CH_MODE(uint8_t ch)       { return CH_BASE(ch) + 0; }
     inline constexpr uint16_t CH_PULSE_MS(uint8_t ch)   { return CH_BASE(ch) + 1; }
     inline constexpr uint16_t CH_COUNT(uint8_t ch)      { return CH_BASE(ch) + 2; }
-    inline constexpr uint16_t CH_ENA_TOGGLE(uint8_t ch) { return CH_BASE(ch) + 3; }
+    inline constexpr uint16_t CH_ENABLE_STATE(uint8_t ch) { return CH_BASE(ch) + 3; }
 
     // System status
     constexpr uint16_t SYS_STATE     = 100;
@@ -157,10 +172,54 @@ namespace Reg {
     constexpr uint16_t INTERLOCK_OK  = 103;
     constexpr uint16_t WATCHDOG_OK   = 104;
     constexpr uint16_t LAST_ERROR    = 105;
+    constexpr uint16_t SUP_STATE     = 106;
+    constexpr uint16_t CMD_QUEUE_DEPTH = 107;
+    constexpr uint16_t LAST_CMD_CODE = 108;
+    constexpr uint16_t LAST_CMD_RESULT = 109;
 
     // Per-channel status (ch = 1..3)
     inline constexpr uint16_t CH_STAT_BASE(uint8_t ch) { return (uint16_t)(110 + (ch - 1) * 10); }
+    inline constexpr uint16_t CH_SUP_BASE(uint8_t ch)  { return (uint16_t)(140 + (ch - 1) * 4); }
+
+    constexpr uint16_t LAST_REJECT_REASON = 152;
+    constexpr uint16_t LAST_CMD_SEQ       = 153;
 }
+
+// ===========================================================================
+// Supervisory state bookkeeping (first-pass refactor)
+// Preserves the existing pulse engine / timer path while moving command
+// acceptance and high-level control decisions toward a mailbox + supervisor loop.
+// ===========================================================================
+struct CommandMailbox {
+    QueuedCommand queue[Cfg::COMMAND_QUEUE_LEN];
+    uint8_t head = 0;
+    uint8_t tail = 0;
+    uint8_t count = 0;
+    uint16_t nextSeq = 1;
+};
+
+// Explicit forward declarations prevent Arduino's auto-prototype pass from
+// emitting prototypes before these enum/struct types are defined.
+static StopReason stopReasonForTopState(TopState state);
+static RejectReason rejectReasonForTopState(TopState state);
+static SupervisorCommandType normalizeSupervisorCommand(uint16_t rawCode);
+static void recordCommandStatus(uint16_t rawCode,
+                                uint16_t seq,
+                                CommandResultCode result,
+                                RejectReason rejectReason = RejectReason::None);
+static bool supervisorAnyChannelActive();
+static SupervisorState currentSupervisorState();
+static bool enqueueSupervisorCommand(uint16_t rawCode);
+static bool dequeueSupervisorCommand(QueuedCommand& out);
+static void supervisorMarkChannelStaged(uint8_t idx);
+static void supervisorMarkChannelComplete(uint8_t idx);
+static void supervisorMarkChannelAborted(uint8_t idx, StopReason reason);
+static void supervisorRefreshChannelState(uint8_t idx);
+static void supervisorRefreshAllChannelStates();
+static bool applyPendingModes();
+static void stopChannel(uint8_t idx, bool clearRequestedMode = true);
+static uint16_t supervisorChField(uint8_t idx, uint8_t field);
+static void setChannelEnabledState(uint8_t idx, bool enabled);
 
 // ===========================================================================
 // Global state
@@ -176,6 +235,15 @@ static uint32_t g_telemMs      = Cfg::WD_DEFAULT_MS;
 static uint32_t g_lastSerialByteMs  = 0;
 static volatile uint8_t g_modeRegisterClearMask = 0;
 static bool     g_commandRegisterClearPending = false;
+static CommandMailbox g_cmdMailbox;
+static SupervisorChannelState g_supCh[3];
+static uint16_t g_lastCommandSeq = 0;
+static uint16_t g_lastCommandCode = 0;
+static CommandResultCode g_lastCommandResult = CommandResultCode::None;
+static RejectReason g_lastRejectReason = RejectReason::None;
+static bool     g_lastInterlockSample = false;
+static bool     g_lastWatchdogSample  = true;
+static bool     g_lcdRefreshPending   = false;
 
 // LCD row caches
 static char g_lcdBuf [Cfg::LCD_ROWS][Cfg::LCD_COLS + 1];
@@ -269,11 +337,252 @@ static uint32_t pulseDurationTicks(uint32_t pulseMs) {
     return pulseMs * Cfg::TIMER_TICKS_PER_MS;
 }
 
-static TopState evaluateState() {
-    if (!interlockOk())  return TopState::SafeInterlock;
-    if (!watchdogOk())   return TopState::SafeWatchdog;
+static TopState evaluateState(bool interlockIsOk, bool watchdogIsOk) {
+    if (!interlockIsOk)  return TopState::SafeInterlock;
+    if (!watchdogIsOk)   return TopState::SafeWatchdog;
     if (g_faultLatched)  return TopState::FaultLatched;
     return TopState::Ready;
+}
+
+static TopState evaluateState() {
+    return evaluateState(interlockOk(), watchdogOk());
+}
+
+static StopReason stopReasonForTopState(TopState state) {
+    switch (state) {
+        case TopState::SafeInterlock: return StopReason::SafeInterlock;
+        case TopState::SafeWatchdog:  return StopReason::SafeWatchdog;
+        case TopState::FaultLatched:  return StopReason::FaultLatched;
+        default:                      return StopReason::None;
+    }
+}
+
+static RejectReason rejectReasonForTopState(TopState state) {
+    switch (state) {
+        case TopState::SafeInterlock: return RejectReason::UnsafeInterlock;
+        case TopState::SafeWatchdog:  return RejectReason::UnsafeWatchdog;
+        case TopState::FaultLatched:  return RejectReason::FaultLatched;
+        default:                      return RejectReason::None;
+    }
+}
+
+static SupervisorCommandType normalizeSupervisorCommand(uint16_t rawCode) {
+    switch (rawCode) {
+        case 1: return SupervisorCommandType::AllOff;
+        case 2:
+        case 3: return SupervisorCommandType::ClearFault;
+        case 4: return SupervisorCommandType::Apply;
+        default: return SupervisorCommandType::None;
+    }
+}
+
+static void recordCommandStatus(uint16_t rawCode,
+                                uint16_t seq,
+                                CommandResultCode result,
+                                RejectReason rejectReason) {
+    g_lastCommandCode = rawCode;
+    g_lastCommandSeq = seq;
+    g_lastCommandResult = result;
+    g_lastRejectReason = rejectReason;
+}
+
+static bool supervisorAnyChannelActive() {
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        const ChannelRunState runState = g_supCh[idx].runState;
+        if (runState == ChannelRunState::Staged ||
+            runState == ChannelRunState::RunningDC ||
+            runState == ChannelRunState::RunningPulse ||
+            runState == ChannelRunState::RunningTrain) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static SupervisorState currentSupervisorState() {
+    switch (g_state) {
+        case TopState::SafeInterlock: return SupervisorState::SafeInterlockHold;
+        case TopState::SafeWatchdog:  return SupervisorState::SafeWatchdogHold;
+        case TopState::FaultLatched:  return SupervisorState::FaultHold;
+        case TopState::Ready:
+        default:
+            break;
+    }
+
+    if (g_cmdMailbox.count != 0) return SupervisorState::CommandQueued;
+    if (supervisorAnyChannelActive()) return SupervisorState::Active;
+    return SupervisorState::Idle;
+}
+
+static bool enqueueSupervisorCommand(uint16_t rawCode) {
+    if (rawCode == 0) return true;
+
+    const SupervisorCommandType type = normalizeSupervisorCommand(rawCode);
+    if (type == SupervisorCommandType::None) {
+        recordCommandStatus(rawCode, 0, CommandResultCode::Rejected, RejectReason::InvalidCommand);
+        g_commandRegisterClearPending = true;
+        return false;
+    }
+
+    if (g_cmdMailbox.count >= Cfg::COMMAND_QUEUE_LEN) {
+        recordCommandStatus(rawCode, 0, CommandResultCode::Rejected, RejectReason::QueueFull);
+        g_commandRegisterClearPending = true;
+        return false;
+    }
+
+    QueuedCommand& slot = g_cmdMailbox.queue[g_cmdMailbox.tail];
+    slot.seq = g_cmdMailbox.nextSeq++;
+    slot.rawCode = rawCode;
+    slot.type = type;
+
+    g_cmdMailbox.tail = (uint8_t)((g_cmdMailbox.tail + 1u) % Cfg::COMMAND_QUEUE_LEN);
+    g_cmdMailbox.count++;
+
+    recordCommandStatus(rawCode, slot.seq, CommandResultCode::Queued);
+    return true;
+}
+
+static bool dequeueSupervisorCommand(QueuedCommand& out) {
+    if (g_cmdMailbox.count == 0) return false;
+
+    out = g_cmdMailbox.queue[g_cmdMailbox.head];
+    g_cmdMailbox.head = (uint8_t)((g_cmdMailbox.head + 1u) % Cfg::COMMAND_QUEUE_LEN);
+    g_cmdMailbox.count--;
+    return true;
+}
+
+static void supervisorMarkChannelStaged(uint8_t idx) {
+    g_supCh[idx].runState = (g_ch[idx].requestedMode == Mode::Off)
+        ? ChannelRunState::Off
+        : ChannelRunState::Staged;
+    g_supCh[idx].completionLatched = false;
+    g_supCh[idx].abortLatched = false;
+    if (g_ch[idx].requestedMode == Mode::Off) {
+        g_supCh[idx].stopReason = StopReason::None;
+    }
+}
+
+static void supervisorMarkChannelComplete(uint8_t idx) {
+    g_supCh[idx].runState = ChannelRunState::Complete;
+    g_supCh[idx].stopReason = StopReason::NormalComplete;
+    g_supCh[idx].completionLatched = true;
+    g_supCh[idx].abortLatched = false;
+}
+
+static void supervisorMarkChannelAborted(uint8_t idx, StopReason reason) {
+    g_supCh[idx].runState = ChannelRunState::Aborted;
+    g_supCh[idx].stopReason = reason;
+    g_supCh[idx].completionLatched = false;
+    g_supCh[idx].abortLatched = true;
+}
+
+static void supervisorRefreshChannelState(uint8_t idx) {
+    Mode activeMode = Mode::Off;
+    bool applyPending = false;
+    Mode requestedMode = Mode::Off;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        activeMode = g_ch[idx].mode;
+        applyPending = g_ch[idx].modeApplyPending;
+        requestedMode = g_ch[idx].requestedMode;
+    }
+
+    if (activeMode == Mode::DC) {
+        g_supCh[idx].runState = ChannelRunState::RunningDC;
+        g_supCh[idx].stopReason = StopReason::None;
+        g_supCh[idx].completionLatched = false;
+        g_supCh[idx].abortLatched = false;
+        return;
+    }
+    if (activeMode == Mode::Pulse) {
+        g_supCh[idx].runState = ChannelRunState::RunningPulse;
+        g_supCh[idx].stopReason = StopReason::None;
+        g_supCh[idx].completionLatched = false;
+        g_supCh[idx].abortLatched = false;
+        return;
+    }
+    if (activeMode == Mode::PulseTrain) {
+        g_supCh[idx].runState = ChannelRunState::RunningTrain;
+        g_supCh[idx].stopReason = StopReason::None;
+        g_supCh[idx].completionLatched = false;
+        g_supCh[idx].abortLatched = false;
+        return;
+    }
+    if (applyPending && requestedMode != Mode::Off) {
+        g_supCh[idx].runState = ChannelRunState::Staged;
+        return;
+    }
+    if (g_supCh[idx].completionLatched || g_supCh[idx].abortLatched) {
+        return;
+    }
+    g_supCh[idx].runState = ChannelRunState::Off;
+    g_supCh[idx].stopReason = StopReason::None;
+}
+
+static void supervisorRefreshAllChannelStates() {
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        supervisorRefreshChannelState(idx);
+    }
+}
+
+static void supervisorStageCommand(uint16_t val) {
+    enqueueSupervisorCommand(val);
+}
+
+static void supervisorProcessCommandMailbox() {
+    QueuedCommand cmd;
+    while (dequeueSupervisorCommand(cmd)) {
+        bool executed = false;
+        RejectReason rejectReason = RejectReason::None;
+
+        switch (cmd.type) {
+            case SupervisorCommandType::AllOff:
+                for (uint8_t i = 0; i < 3; i++) {
+                    stopChannel(i, true);
+                    supervisorMarkChannelAborted(i, StopReason::AllOffCommand);
+                }
+                mb.cbDisable();
+                for (uint8_t i = 0; i < 3; i++) mb.Hreg(Reg::CH_MODE(i + 1), 0);
+                mb.cbEnable(true);
+                executed = true;
+                break;
+
+            case SupervisorCommandType::ClearFault:
+                if (!interlockOk()) {
+                    g_lastError = 12;
+                    mb.Hreg(Reg::LAST_ERROR, g_lastError);
+                    rejectReason = RejectReason::ClearFaultWhileInterlockOpen;
+                } else {
+                    g_faultLatched = false;
+                    for (uint8_t i = 0; i < 3; i++) {
+                        if (g_supCh[i].abortLatched &&
+                            g_supCh[i].stopReason == StopReason::FaultLatched) {
+                            g_supCh[i].runState = ChannelRunState::Off;
+                            g_supCh[i].stopReason = StopReason::None;
+                            g_supCh[i].abortLatched = false;
+                            g_supCh[i].completionLatched = false;
+                        }
+                    }
+                    executed = true;
+                }
+                break;
+
+            case SupervisorCommandType::Apply:
+                executed = applyPendingModes();
+                if (!executed) rejectReason = rejectReasonForTopState(evaluateState());
+                break;
+
+            case SupervisorCommandType::None:
+            default:
+                rejectReason = RejectReason::InvalidCommand;
+                break;
+        }
+
+        recordCommandStatus(cmd.rawCode,
+                            cmd.seq,
+                            executed ? CommandResultCode::Executed : CommandResultCode::Rejected,
+                            rejectReason);
+        g_commandRegisterClearPending = true;
+    }
 }
 
 static void timerHardwareInit() {
@@ -397,7 +706,7 @@ static void stopChannelUnsafe(uint8_t idx, bool clearRequestedMode) {
     setGateStateUnsafe(idx, false);
 }
 
-static void stopChannel(uint8_t idx, bool clearRequestedMode = true) {
+static void stopChannel(uint8_t idx, bool clearRequestedMode) {
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
         stopChannelUnsafe(idx, clearRequestedMode);
     }
@@ -407,6 +716,14 @@ static void triggerEnableToggle(uint8_t idx) {
     g_ch[idx].enaToggleStartUs = micros();
     g_ch[idx].enaToggleActive  = true;
     digitalWrite(Pins::ENA[idx], HIGH);
+}
+
+static void setChannelEnabledState(uint8_t idx, bool enabled) {
+    Channel& c = g_ch[idx];
+    if (c.enabled == enabled) return;
+
+    c.enabled = enabled;
+    triggerEnableToggle(idx);
 }
 
 static void tickEnableToggles() {
@@ -578,18 +895,25 @@ static bool applyPendingModes() {
 
 static void handleSafetyTrip() {
     uint8_t clearMask = 0;
+    const StopReason reason = stopReasonForTopState(evaluateState());
 
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
         for (uint8_t idx = 0; idx < 3; idx++) {
             Channel& c = g_ch[idx];
             const bool clearRequestedMode =
-                c.modeApplyPending || c.mode == Mode::Pulse || c.mode == Mode::PulseTrain;
+                c.modeApplyPending || c.mode == Mode::DC || c.mode == Mode::Pulse || c.mode == Mode::PulseTrain;
+            const bool wasActive =
+                c.modeApplyPending || c.mode == Mode::DC || c.mode == Mode::Pulse || c.mode == Mode::PulseTrain;
 
             if (clearRequestedMode) {
                 stopChannelUnsafe(idx, true);
                 clearMask |= channelMaskBit(idx);
             } else {
                 timerStopUnsafe(idx);
+            }
+
+            if (wasActive) {
+                supervisorMarkChannelAborted(idx, reason);
             }
         }
     }
@@ -623,6 +947,9 @@ static void syncDeferredRegisters() {
         g_ch[idx].requestedMode = Mode::Off;
         g_ch[idx].modeApplyPending = false;
         mb.Hreg(Reg::CH_MODE(idx + 1), 0);
+        if (!g_supCh[idx].abortLatched) {
+            supervisorMarkChannelComplete(idx);
+        }
     }
     mb.cbEnable(true);
 }
@@ -645,27 +972,11 @@ static void applyDC() {
 static void handleModeWrite(uint8_t idx, uint16_t val) {
     Mode newMode = (Mode)(val & 0x03);
 
-    if (newMode == Mode::Off) {
-        g_ch[idx].requestedMode = Mode::Off;
-        g_ch[idx].modeApplyPending = true;
-        return;
-    }
-
-    // Use evaluateState() directly — g_state is stale inside mb.task() callbacks
-    // (it is only refreshed in loop() after mb.task() returns).
-    if (evaluateState() != TopState::Ready) {
-        g_lastError = 10;
-        mb.Hreg(Reg::LAST_ERROR, g_lastError);
-        // Do NOT call mb.Hreg(CH_MODE, …) here — the library triggers ON_SET callbacks
-        // on Hreg writes, which would recurse back into this callback indefinitely.
-        // The cbSetCHxMode return value (g_ch[idx].requestedMode, unchanged) restores the register.
-        return;
-    }
-
     if (newMode == Mode::Pulse && g_ch[idx].count > 1) newMode = Mode::PulseTrain;
 
     g_ch[idx].requestedMode = newMode;
     g_ch[idx].modeApplyPending = true;
+    supervisorMarkChannelStaged(idx);
 }
 
 // ===========================================================================
@@ -686,26 +997,10 @@ uint16_t cbSetTelemetry(TRegister* reg, uint16_t val) {
 
 uint16_t cbSetCommand(TRegister* reg, uint16_t val) {
     feedWatchdog();
-    switch (val) {
-        case 0: break;
-        case 1:
-            for (uint8_t i = 0; i < 3; i++) stopChannel(i, true);
-            // Disable callbacks while updating control registers to avoid triggering
-            // cbSetCHxMode from within cbSetCommand (cross-callback writes).
-            mb.cbDisable();
-            for (uint8_t i = 0; i < 3; i++) mb.Hreg(Reg::CH_MODE(i + 1), 0);
-            mb.cbEnable(true);
-            break;
-        case 2: case 3:
-            if (!interlockOk()) { g_lastError = 12; mb.Hreg(Reg::LAST_ERROR, g_lastError); }
-            else g_faultLatched = false;
-            break;
-        case 4:
-            applyPendingModes();
-            break;
-        default: break;
-    }
-    g_commandRegisterClearPending = (val != 0);
+    supervisorStageCommand(val);
+    // Drain immediately so staged host writes followed by COMMAND=4 keep the
+    // legacy 'apply now' behavior expected by pulser_test_gui.py.
+    supervisorProcessCommandMailbox();
     return val;
 }
 
@@ -749,9 +1044,21 @@ uint16_t cbSetCH3Count(TRegister* reg, uint16_t val) {
     g_lastError = 3; mb.Hreg(Reg::LAST_ERROR, g_lastError); return (uint16_t)g_ch[2].count;
 }
 
-uint16_t cbSetCH1EnaToggle(TRegister* reg, uint16_t val) { feedWatchdog(); if (val == 1) triggerEnableToggle(0); return 0; }
-uint16_t cbSetCH2EnaToggle(TRegister* reg, uint16_t val) { feedWatchdog(); if (val == 1) triggerEnableToggle(1); return 0; }
-uint16_t cbSetCH3EnaToggle(TRegister* reg, uint16_t val) { feedWatchdog(); if (val == 1) triggerEnableToggle(2); return 0; }
+static uint16_t handleEnableStateWrite(uint8_t idx, uint16_t val) {
+    feedWatchdog();
+    if (val <= 1) {
+        setChannelEnabledState(idx, val != 0);
+        return g_ch[idx].enabled ? 1 : 0;
+    }
+
+    g_lastError = 3;
+    mb.Hreg(Reg::LAST_ERROR, g_lastError);
+    return g_ch[idx].enabled ? 1 : 0;
+}
+
+uint16_t cbSetCH1EnableState(TRegister* reg, uint16_t val) { return handleEnableStateWrite(0, val); }
+uint16_t cbSetCH2EnableState(TRegister* reg, uint16_t val) { return handleEnableStateWrite(1, val); }
+uint16_t cbSetCH3EnableState(TRegister* reg, uint16_t val) { return handleEnableStateWrite(2, val); }
 
 // ===========================================================================
 // Modbus onGet callbacks (status registers -- live values)
@@ -764,9 +1071,15 @@ uint16_t cbGetSysReason   (TRegister* reg, uint16_t val) { return (uint16_t)g_st
 uint16_t cbGetFaultLatched(TRegister* reg, uint16_t val) { return g_faultLatched ? 1 : 0; }
 uint16_t cbGetInterlockOk (TRegister* reg, uint16_t val) { return interlockOk()  ? 1 : 0; }
 uint16_t cbGetWatchdogOk  (TRegister* reg, uint16_t val) { return watchdogOk()   ? 1 : 0; }
+uint16_t cbGetSupervisorState(TRegister* reg, uint16_t val) { return (uint16_t)currentSupervisorState(); }
+uint16_t cbGetCommandQueueDepth(TRegister* reg, uint16_t val) { return (uint16_t)g_cmdMailbox.count; }
+uint16_t cbGetLastCommandCode(TRegister* reg, uint16_t val) { return g_lastCommandCode; }
+uint16_t cbGetLastCommandResult(TRegister* reg, uint16_t val) { return (uint16_t)g_lastCommandResult; }
 uint16_t cbGetLastError   (TRegister* reg, uint16_t val) {
     uint16_t e = g_lastError; g_lastError = 0; mb.Hreg(Reg::LAST_ERROR, 0); return e;
 }
+uint16_t cbGetLastRejectReason(TRegister* reg, uint16_t val) { return (uint16_t)g_lastRejectReason; }
+uint16_t cbGetLastCommandSeq(TRegister* reg, uint16_t val) { return g_lastCommandSeq; }
 
 static uint16_t liveChField(uint8_t idx, uint8_t field) {
     Mode activeMode = Mode::Off;
@@ -781,8 +1094,19 @@ static uint16_t liveChField(uint8_t idx, uint8_t field) {
         case 1: return (uint16_t)g_ch[idx].pulseMs;
         case 2: return (uint16_t)g_ch[idx].count;
         case 3: return (uint16_t)pulsesLeft;
-        case 4: case 5: case 6: case 7: return 0;  // not wired in HW rev 2026-03-17
+        case 4: return g_ch[idx].enabled ? 1 : 0;
+        case 5: case 6: case 7: return 0;  // not wired in HW rev 2026-03-17
         case 8: return (digitalRead(Pins::GATE[idx]) == HIGH) ? 1 : 0;
+        default: return 0;
+    }
+}
+
+static uint16_t supervisorChField(uint8_t idx, uint8_t field) {
+    switch (field) {
+        case 0: return (uint16_t)g_supCh[idx].runState;
+        case 1: return (uint16_t)g_supCh[idx].stopReason;
+        case 2: return g_supCh[idx].completionLatched ? 1 : 0;
+        case 3: return g_supCh[idx].abortLatched ? 1 : 0;
         default: return 0;
     }
 }
@@ -802,6 +1126,16 @@ MAKE_CH_STAT_CALLBACKS(1)
 MAKE_CH_STAT_CALLBACKS(2)
 MAKE_CH_STAT_CALLBACKS(3)
 
+#define MAKE_CH_SUP_CALLBACKS(IDX)                                                   \
+uint16_t cbGetCH##IDX##SUP0(TRegister* r, uint16_t v){ return supervisorChField(IDX-1,0);}\
+uint16_t cbGetCH##IDX##SUP1(TRegister* r, uint16_t v){ return supervisorChField(IDX-1,1);}\
+uint16_t cbGetCH##IDX##SUP2(TRegister* r, uint16_t v){ return supervisorChField(IDX-1,2);}\
+uint16_t cbGetCH##IDX##SUP3(TRegister* r, uint16_t v){ return supervisorChField(IDX-1,3);}
+
+MAKE_CH_SUP_CALLBACKS(1)
+MAKE_CH_SUP_CALLBACKS(2)
+MAKE_CH_SUP_CALLBACKS(3)
+
 // ===========================================================================
 // Modbus register setup
 // ===========================================================================
@@ -819,7 +1153,7 @@ static void modbusSetupRegisters() {
         mb.addHreg(Reg::CH_MODE(ch),       0);
         mb.addHreg(Reg::CH_PULSE_MS(ch),   10);
         mb.addHreg(Reg::CH_COUNT(ch),      1);
-        mb.addHreg(Reg::CH_ENA_TOGGLE(ch), 0);
+        mb.addHreg(Reg::CH_ENABLE_STATE(ch), 0);
     }
     mb.onSetHreg(Reg::CH_MODE(1),       cbSetCH1Mode);
     mb.onSetHreg(Reg::CH_MODE(2),       cbSetCH2Mode);
@@ -830,9 +1164,9 @@ static void modbusSetupRegisters() {
     mb.onSetHreg(Reg::CH_COUNT(1),      cbSetCH1Count);
     mb.onSetHreg(Reg::CH_COUNT(2),      cbSetCH2Count);
     mb.onSetHreg(Reg::CH_COUNT(3),      cbSetCH3Count);
-    mb.onSetHreg(Reg::CH_ENA_TOGGLE(1), cbSetCH1EnaToggle);
-    mb.onSetHreg(Reg::CH_ENA_TOGGLE(2), cbSetCH2EnaToggle);
-    mb.onSetHreg(Reg::CH_ENA_TOGGLE(3), cbSetCH3EnaToggle);
+    mb.onSetHreg(Reg::CH_ENABLE_STATE(1), cbSetCH1EnableState);
+    mb.onSetHreg(Reg::CH_ENABLE_STATE(2), cbSetCH2EnableState);
+    mb.onSetHreg(Reg::CH_ENABLE_STATE(3), cbSetCH3EnableState);
 
     // System status
     mb.addHreg(Reg::SYS_STATE,     0);
@@ -841,12 +1175,20 @@ static void modbusSetupRegisters() {
     mb.addHreg(Reg::INTERLOCK_OK,  0);
     mb.addHreg(Reg::WATCHDOG_OK,   0);
     mb.addHreg(Reg::LAST_ERROR,    0);
-    mb.onGetHreg(Reg::SYS_STATE,     cbGetSysState);
-    mb.onGetHreg(Reg::SYS_REASON,    cbGetSysReason);
-    mb.onGetHreg(Reg::FAULT_LATCHED, cbGetFaultLatched);
-    mb.onGetHreg(Reg::INTERLOCK_OK,  cbGetInterlockOk);
-    mb.onGetHreg(Reg::WATCHDOG_OK,   cbGetWatchdogOk);
-    mb.onGetHreg(Reg::LAST_ERROR,    cbGetLastError);
+    mb.addHreg(Reg::SUP_STATE,     0);
+    mb.addHreg(Reg::CMD_QUEUE_DEPTH, 0);
+    mb.addHreg(Reg::LAST_CMD_CODE, 0);
+    mb.addHreg(Reg::LAST_CMD_RESULT, 0);
+    mb.onGetHreg(Reg::SYS_STATE,       cbGetSysState);
+    mb.onGetHreg(Reg::SYS_REASON,      cbGetSysReason);
+    mb.onGetHreg(Reg::FAULT_LATCHED,   cbGetFaultLatched);
+    mb.onGetHreg(Reg::INTERLOCK_OK,    cbGetInterlockOk);
+    mb.onGetHreg(Reg::WATCHDOG_OK,     cbGetWatchdogOk);
+    mb.onGetHreg(Reg::LAST_ERROR,      cbGetLastError);
+    mb.onGetHreg(Reg::SUP_STATE,       cbGetSupervisorState);
+    mb.onGetHreg(Reg::CMD_QUEUE_DEPTH, cbGetCommandQueueDepth);
+    mb.onGetHreg(Reg::LAST_CMD_CODE,   cbGetLastCommandCode);
+    mb.onGetHreg(Reg::LAST_CMD_RESULT, cbGetLastCommandResult);
 
     // Per-channel status
     typedef uint16_t (*CbFn)(TRegister*, uint16_t);
@@ -868,6 +1210,25 @@ static void modbusSetupRegisters() {
         mb.onGetHreg(Reg::CH_STAT_BASE(2) + f, ch2cbs[f]);
         mb.onGetHreg(Reg::CH_STAT_BASE(3) + f, ch3cbs[f]);
     }
+
+    // Supervisor extension status
+    static const CbFn ch1sup[4] = { cbGetCH1SUP0, cbGetCH1SUP1, cbGetCH1SUP2, cbGetCH1SUP3 };
+    static const CbFn ch2sup[4] = { cbGetCH2SUP0, cbGetCH2SUP1, cbGetCH2SUP2, cbGetCH2SUP3 };
+    static const CbFn ch3sup[4] = { cbGetCH3SUP0, cbGetCH3SUP1, cbGetCH3SUP2, cbGetCH3SUP3 };
+
+    for (uint8_t f = 0; f < 4; f++) {
+        mb.addHreg(Reg::CH_SUP_BASE(1) + f, 0);
+        mb.addHreg(Reg::CH_SUP_BASE(2) + f, 0);
+        mb.addHreg(Reg::CH_SUP_BASE(3) + f, 0);
+        mb.onGetHreg(Reg::CH_SUP_BASE(1) + f, ch1sup[f]);
+        mb.onGetHreg(Reg::CH_SUP_BASE(2) + f, ch2sup[f]);
+        mb.onGetHreg(Reg::CH_SUP_BASE(3) + f, ch3sup[f]);
+    }
+
+    mb.addHreg(Reg::LAST_REJECT_REASON, 0);
+    mb.addHreg(Reg::LAST_CMD_SEQ, 0);
+    mb.onGetHreg(Reg::LAST_REJECT_REASON, cbGetLastRejectReason);
+    mb.onGetHreg(Reg::LAST_CMD_SEQ, cbGetLastCommandSeq);
 }
 
 // ===========================================================================
@@ -909,19 +1270,20 @@ static void lcdInit() {
     }
 }
 
-static void lcdUpdate() {
+static void lcdUpdate(bool interlockIsOk, bool watchdogIsOk, bool forceRefresh = false) {
     if (!g_lcd) return;
     uint32_t now = millis();
     // Defer if a serial byte arrived recently (I2C / RS-485 noise guard)
     if ((now - g_lastSerialByteMs) < Cfg::LCD_SERIAL_DEFER_MS) return;
-    if ((now - g_lcdLastRefreshMs) < Cfg::LCD_REFRESH_MS)      return;
+    if (!forceRefresh && (now - g_lcdLastRefreshMs) < Cfg::LCD_REFRESH_MS) return;
     g_lcdLastRefreshMs = now;
+    g_lcdRefreshPending = false;
 
     // Build row 0: system status
     snprintf(g_lcdBuf[0], Cfg::LCD_COLS + 1,
              "WDG:%-2s INT:%-2s FLT:%d  ",
-             watchdogOk()  ? "OK" : "NO",
-             interlockOk() ? "OK" : "NO",
+             watchdogIsOk  ? "OK" : "NO",
+             interlockIsOk ? "OK" : "NO",
              (int)g_faultLatched);
 
     // Rows 1-3: per channel
@@ -989,8 +1351,15 @@ void setup() {
     lcdInit();
 #endif
 
+    for (uint8_t idx = 0; idx < 3; idx++) {
+        g_supCh[idx] = SupervisorChannelState{};
+    }
+
     // SW watchdog first feed
     feedWatchdog();
+    g_lastInterlockSample = interlockOk();
+    g_lastWatchdogSample = watchdogOk();
+    supervisorRefreshAllChannelStates();
 
     // Hardware WDT last (8 s)
     wdt_enable(WDTO_8S);
@@ -1010,8 +1379,19 @@ void loop() {
 #endif
 
     mb.task();
+    supervisorProcessCommandMailbox();
 
-    const TopState nextState = evaluateState();
+    const bool interlockIsOk = interlockOk();
+    const bool watchdogIsOk = watchdogOk();
+    if ((interlockIsOk != g_lastInterlockSample) ||
+        (watchdogIsOk != g_lastWatchdogSample)) {
+        g_lcdRefreshPending = true;
+    }
+
+    g_lastInterlockSample = interlockIsOk;
+    g_lastWatchdogSample = watchdogIsOk;
+
+    const TopState nextState = evaluateState(interlockIsOk, watchdogIsOk);
     if (g_state == TopState::Ready && nextState != TopState::Ready) {
         handleSafetyTrip();
     }
@@ -1025,8 +1405,9 @@ void loop() {
 
     tickEnableToggles();
     syncDeferredRegisters();
+    supervisorRefreshAllChannelStates();
 
 #if BCON_ENABLE_LCD
-    lcdUpdate();
+    lcdUpdate(interlockIsOk, watchdogIsOk, g_lcdRefreshPending);
 #endif
 }
