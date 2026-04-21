@@ -207,7 +207,7 @@ Current build-time options in [BCON_mega_modbus.ino](BCON_mega_modbus/BCON_mega_
 | `BCON_USE_USB_SERIAL` | `1` for USB serial bench mode, `0` for RS-485 production mode |
 | `BCON_ENABLE_LCD` | enable or disable the 20x4 I2C LCD |
 
-Current checked-in defaults on this branch: `BCON_USE_USB_SERIAL=1` and `BCON_ENABLE_LCD=1`.
+Current checked-in defaults on this branch: `BCON_USE_USB_SERIAL=0` and `BCON_ENABLE_LCD=1`.
 
 ### Control Registers
 
