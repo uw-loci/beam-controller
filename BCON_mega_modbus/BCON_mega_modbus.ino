@@ -12,7 +12,7 @@
 //  System control:
 //    0  WATCHDOG_MS      SW watchdog timeout (50-60000 ms, default 1500)
 //    1  TELEMETRY_MS     Informational host poll interval (not enforced)
-//    2  COMMAND          0=NOP, 1=AllOff, 2/3=ClearFault, 4=ApplyStagedModes
+//    2  COMMAND          0=NOP, 1=AllOff, 4=ApplyStagedModes (2/3 reserved)
 //
 //  Channel control  (base = ch*10, ch=1..3):
 //    base+0  MODE           staged requested mode (including Off); write COMMAND=4 to apply
@@ -21,9 +21,9 @@
 //    base+3  ENABLE_STATE   explicit enable request (0=disabled, 1=enabled)
 //
 //  System status (read-only):
-//    100  SYS_STATE      0=Ready 1=SafeInterlock 2=SafeWatchdog 3=FaultLatched
+//    100  SYS_STATE      0=Ready 1=SafeInterlock 2=SafeWatchdog
 //    101  SYS_REASON     mirrors SYS_STATE
-//    102  FAULT_LATCHED  1 if OC fault latched
+//    102  FAULT_LATCHED  reserved compatibility register (always 0)
 //    103  INTERLOCK_OK   1 if arm-beams interlock asserted
 //    104  WATCHDOG_OK    1 if SW watchdog alive
 //    105  LAST_ERROR     last error code (auto-cleared on read)
@@ -226,7 +226,6 @@ static void setChannelEnabledState(uint8_t idx, bool enabled);
 // ===========================================================================
 static Channel  g_ch[3];
 static TopState g_state        = TopState::SafeWatchdog;
-static bool     g_faultLatched = false;
 static uint32_t g_wdTimeoutMs  = Cfg::WD_DEFAULT_MS;
 static uint32_t g_wdLastFeedMs = 0;
 static uint32_t g_bootMs       = 0;
@@ -340,7 +339,6 @@ static uint32_t pulseDurationTicks(uint32_t pulseMs) {
 static TopState evaluateState(bool interlockIsOk, bool watchdogIsOk) {
     if (!interlockIsOk)  return TopState::SafeInterlock;
     if (!watchdogIsOk)   return TopState::SafeWatchdog;
-    if (g_faultLatched)  return TopState::FaultLatched;
     return TopState::Ready;
 }
 
@@ -352,7 +350,6 @@ static StopReason stopReasonForTopState(TopState state) {
     switch (state) {
         case TopState::SafeInterlock: return StopReason::SafeInterlock;
         case TopState::SafeWatchdog:  return StopReason::SafeWatchdog;
-        case TopState::FaultLatched:  return StopReason::FaultLatched;
         default:                      return StopReason::None;
     }
 }
@@ -361,7 +358,6 @@ static RejectReason rejectReasonForTopState(TopState state) {
     switch (state) {
         case TopState::SafeInterlock: return RejectReason::UnsafeInterlock;
         case TopState::SafeWatchdog:  return RejectReason::UnsafeWatchdog;
-        case TopState::FaultLatched:  return RejectReason::FaultLatched;
         default:                      return RejectReason::None;
     }
 }
@@ -369,8 +365,6 @@ static RejectReason rejectReasonForTopState(TopState state) {
 static SupervisorCommandType normalizeSupervisorCommand(uint16_t rawCode) {
     switch (rawCode) {
         case 1: return SupervisorCommandType::AllOff;
-        case 2:
-        case 3: return SupervisorCommandType::ClearFault;
         case 4: return SupervisorCommandType::Apply;
         default: return SupervisorCommandType::None;
     }
@@ -403,7 +397,6 @@ static SupervisorState currentSupervisorState() {
     switch (g_state) {
         case TopState::SafeInterlock: return SupervisorState::SafeInterlockHold;
         case TopState::SafeWatchdog:  return SupervisorState::SafeWatchdogHold;
-        case TopState::FaultLatched:  return SupervisorState::FaultHold;
         case TopState::Ready:
         default:
             break;
@@ -544,26 +537,6 @@ static void supervisorProcessCommandMailbox() {
                 for (uint8_t i = 0; i < 3; i++) mb.Hreg(Reg::CH_MODE(i + 1), 0);
                 mb.cbEnable(true);
                 executed = true;
-                break;
-
-            case SupervisorCommandType::ClearFault:
-                if (!interlockOk()) {
-                    g_lastError = 12;
-                    mb.Hreg(Reg::LAST_ERROR, g_lastError);
-                    rejectReason = RejectReason::ClearFaultWhileInterlockOpen;
-                } else {
-                    g_faultLatched = false;
-                    for (uint8_t i = 0; i < 3; i++) {
-                        if (g_supCh[i].abortLatched &&
-                            g_supCh[i].stopReason == StopReason::FaultLatched) {
-                            g_supCh[i].runState = ChannelRunState::Off;
-                            g_supCh[i].stopReason = StopReason::None;
-                            g_supCh[i].abortLatched = false;
-                            g_supCh[i].completionLatched = false;
-                        }
-                    }
-                    executed = true;
-                }
                 break;
 
             case SupervisorCommandType::Apply:
@@ -1068,7 +1041,7 @@ uint16_t cbSetCH3EnableState(TRegister* reg, uint16_t val) { return handleEnable
 // as via writes, matching the README intent ("any valid Modbus frame").
 uint16_t cbGetSysState    (TRegister* reg, uint16_t val) { feedWatchdog(); return (uint16_t)g_state; }
 uint16_t cbGetSysReason   (TRegister* reg, uint16_t val) { return (uint16_t)g_state; }
-uint16_t cbGetFaultLatched(TRegister* reg, uint16_t val) { return g_faultLatched ? 1 : 0; }
+uint16_t cbGetFaultLatched(TRegister* reg, uint16_t val) { return 0; }
 uint16_t cbGetInterlockOk (TRegister* reg, uint16_t val) { return interlockOk()  ? 1 : 0; }
 uint16_t cbGetWatchdogOk  (TRegister* reg, uint16_t val) { return watchdogOk()   ? 1 : 0; }
 uint16_t cbGetSupervisorState(TRegister* reg, uint16_t val) { return (uint16_t)currentSupervisorState(); }
@@ -1281,10 +1254,9 @@ static void lcdUpdate(bool interlockIsOk, bool watchdogIsOk, bool forceRefresh =
 
     // Build row 0: system status
     snprintf(g_lcdBuf[0], Cfg::LCD_COLS + 1,
-             "WDG:%-2s INT:%-2s FLT:%d  ",
+             "WDG:%-2s INT:%-2s      ",
              watchdogIsOk  ? "OK" : "NO",
-             interlockIsOk ? "OK" : "NO",
-             (int)g_faultLatched);
+             interlockIsOk ? "OK" : "NO");
 
     // Rows 1-3: per channel
     for (uint8_t i = 0; i < 3; i++) {
