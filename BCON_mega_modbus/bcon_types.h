@@ -8,7 +8,6 @@ enum class TopState : uint8_t {
     Ready          = 0,
     SafeInterlock  = 1,
     SafeWatchdog   = 2,
-    FaultLatched   = 3,
 };
 
 // Channel output mode
@@ -56,8 +55,6 @@ enum class StopReason : uint8_t {
     AllOffCommand = 2,
     SafeInterlock = 3,
     SafeWatchdog = 4,
-    FaultLatched = 5,
-    ClearFaultCommand = 6,
 };
 
 // Overall supervisor summary state
@@ -67,7 +64,6 @@ enum class SupervisorState : uint8_t {
     CommandQueued = 2,
     SafeInterlockHold = 3,
     SafeWatchdogHold = 4,
-    FaultHold = 5,
 };
 
 // Last-command result reporting
@@ -85,15 +81,12 @@ enum class RejectReason : uint8_t {
     QueueFull = 2,
     UnsafeInterlock = 3,
     UnsafeWatchdog = 4,
-    FaultLatched = 5,
-    ClearFaultWhileInterlockOpen = 6,
 };
 
 // Normalized supervisor command types derived from Modbus COMMAND writes
 enum class SupervisorCommandType : uint8_t {
     None = 0,
     AllOff = 1,
-    ClearFault = 2,
     Apply = 4,
 };
 
