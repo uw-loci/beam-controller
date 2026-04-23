@@ -1267,8 +1267,8 @@ static void lcdUpdate(bool interlockIsOk, bool watchdogIsOk, bool forceRefresh =
             pulsesLeft = g_ch[i].pulsesLeft;
         }
         snprintf(g_lcdBuf[i + 1], Cfg::LCD_COLS + 1,
-                 "CH%d %s O:%d R:%-5u   ",
-                 i + 1,
+                 "CH %c %s O:%d R:%-5u  ",
+                 (char)('A' + i),
                  modeAbbrev(activeMode),
                  (digitalRead(Pins::GATE[i]) == HIGH) ? 1 : 0,
                  (unsigned int)(pulsesLeft & 0xFFFFu));
