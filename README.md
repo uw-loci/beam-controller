@@ -67,7 +67,6 @@ flowchart LR
 
     E[Interlock Input] --> D
     F[Watchdog Freshness] --> D
-    G[Fault Latch State] --> D
 
     D --> H[Per-Channel Semantic State]
     D --> I[Pulse Engine Control]
@@ -92,20 +91,18 @@ flowchart TD
     A[Modbus write arrives] --> B{Register type}
     B -->|CHx_MODE / CHx_PULSE_MS / CHx_COUNT| C[Stage requested values]
     B -->|COMMAND| D[Normalize command]
-    D --> E{Valid and mailbox space available?}
+    D --> E{Valid command and mailbox space available?}
     E -->|Yes| F[Push command into mailbox]
     E -->|No| G[Record rejected command result]
     F --> H[Drain mailbox immediately]
     H --> I{Command type}
     I -->|Apply| J[Apply staged modes if safe]
     I -->|All Off| K[Stop all channels]
-    I -->|Clear Fault| L[Clear fault latch if allowed]
     J --> M[Update status / command result]
     K --> M
-    L --> M
 ```
 
-After each accepted or rejected command, the firmware clears `COMMAND` back to `0`.
+After each accepted or rejected command, the firmware clears `COMMAND` back to `0`. `COMMAND=2`, `COMMAND=3`, and any other unsupported nonzero value are rejected as invalid commands.
 
 ### 2. Safety Flow
 
@@ -118,13 +115,10 @@ flowchart TD
     C -->|No| D[SafeInterlock]
     C -->|Yes| E{Watchdog OK?}
     E -->|No| F[SafeWatchdog]
-    E -->|Yes| G{Fault latched?}
-    G -->|Yes| H[FaultLatched]
-    G -->|No| I[Ready]
+    E -->|Yes| I[Ready]
 
     D --> J[Force outputs low]
     F --> J
-    H --> J
     I --> K[Allow DC hold and pulse engine activity]
 ```
 
@@ -154,7 +148,6 @@ Top-level safety states from [bcon_types.h](BCON_mega_modbus/bcon_types.h):
 | `Ready` | 0 | Outputs may operate |
 | `SafeInterlock` | 1 | Interlock not satisfied; outputs forced low |
 | `SafeWatchdog` | 2 | Heartbeat stale; outputs forced low |
-| `FaultLatched` | 3 | Fault state latched; outputs forced low |
 
 Notes:
 - the software watchdog timeout is configurable through register `0` (`WATCHDOG_MS`)
@@ -219,7 +212,7 @@ Current checked-in defaults on this branch: `BCON_USE_USB_SERIAL=0` and `BCON_EN
 | `10/20/30 +0` | `CHx_MODE` | staged requested mode |
 | `10/20/30 +1` | `CHx_PULSE_MS` | pulse duration |
 | `10/20/30 +2` | `CHx_COUNT` | pulse count |
-| `10/20/30 +3` | `CHx_ENABLE_TOGGLE` | write `1` for 100 ms enable pulse |
+| `10/20/30 +3` | `CHx_ENABLE_STATE` | explicit latched enable state (`0` disabled, `1` enabled); changing the state triggers a 100 ms enable output pulse |
 
 ### COMMAND Values
 
@@ -227,8 +220,8 @@ Current checked-in defaults on this branch: `BCON_USE_USB_SERIAL=0` and `BCON_EN
 |---|---|
 | `0` | NOP / heartbeat write |
 | `1` | all off |
-| `2` or `3` | clear fault if the interlock is closed |
 | `4` | apply staged modes |
+| other nonzero values, including `2` and `3` | rejected as invalid commands |
 
 ### Legacy System Status Registers
 
@@ -238,7 +231,7 @@ These remain in place for GUI compatibility.
 |---|---|---|
 | `100` | `SYS_STATE` | top-level state |
 | `101` | `SYS_REASON` | mirrors `SYS_STATE` |
-| `102` | `FAULT_LATCHED` | latched fault flag |
+| `102` | `FAULT_LATCHED` | reserved compatibility placeholder; current firmware returns `0` unconditionally |
 | `103` | `INTERLOCK_OK` | interlock state |
 | `104` | `WATCHDOG_OK` | watchdog freshness |
 | `105` | `LAST_ERROR` | last error code |
@@ -272,7 +265,7 @@ Fields:
 | `+1` | `pulse_ms` | configured pulse duration |
 | `+2` | `count` | configured pulse count |
 | `+3` | `remaining` | pulses left in active train |
-| `+4` | `enable_status` | currently not wired, returns `0` |
+| `+4` | `enable_status` | latched channel enable state (`0` disabled, `1` enabled) |
 | `+5` | `power_status` | currently not wired, returns `0` |
 | `+6` | `overcurrent` | currently not wired, returns `0` |
 | `+7` | `gated` | currently not wired, returns `0` |
@@ -302,8 +295,10 @@ The existing Python GUI workflow is intentionally preserved:
 1. write `PULSE_MS` / `COUNT`
 2. write staged `CHx_MODE`
 3. write `COMMAND=4`
-4. poll `100-105` and `110-138` as before
-5. optionally read `106-109` and `140-153` for richer supervisor telemetry
+4. poll `100-105` plus each channel status block separately: `110-118`, `120-128`, and `130-138`
+5. optionally read `106-109`, `140-151`, and `152-153` for richer supervisor and command telemetry
+
+Do not read `110-138` as one contiguous block. The channel status stride has unimplemented gap addresses such as `119` and `129`, and the firmware rejects reads that cross those gaps.
 
 Recommended heartbeat behavior:
 - continue polling `SYS_STATE`; in the current firmware that read also feeds the software watchdog
@@ -326,8 +321,8 @@ The current firmware branch is intended to remain usable with `pulser_test_gui.p
 
 A few things are intentionally still in transition:
 - the pulse engine is authoritative for exact timing, while the supervisor owns command ordering and semantic reporting
-- the overcurrent/fault-latch entry path is not yet fully implemented from live hardware fault inputs
-- channel status fields `+4` through `+7` are placeholders and currently return `0`
+- live overcurrent inputs and fault-latch behavior are not currently implemented; overcurrent status returns `0` and `FAULT_LATCHED` is a compatibility placeholder
+- channel status fields `+5` through `+7` are placeholders and currently return `0`
 - heartbeat semantics are still backward-compatible with existing GUI polling and periodic NOP writes rather than fully migrated to a dedicated supervisor heartbeat command model
 
 ## Development Guidance
@@ -349,3 +344,4 @@ The Arduino build may emit a warning like:
 `LiquidCrystal_I2C claims to run on all architectures and may be incompatible with avr`
 
 That warning is from library metadata and does not, by itself, indicate a firmware problem. The current firmware targets AVR and uses the LCD only as an optional local status display.
+
