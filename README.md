@@ -20,6 +20,7 @@ Firmware for running a 3-channel BCON beam-gate pulser from an Arduino Mega 2560
 
 - [BCON_mega_modbus/BCON_mega_modbus.ino](BCON_mega_modbus/BCON_mega_modbus.ino): main firmware, Modbus register callbacks, supervisor, timer pulse engine, GPIO, safety loop, and LCD support
 - [BCON_mega_modbus/bcon_types.h](BCON_mega_modbus/bcon_types.h): shared enums and state structs
+- [EBEAM_dashboard/instrumentctl/BCON/bcon_driver.py](../EBEAM_dashboard/instrumentctl/BCON/bcon_driver.py): dashboard backend driver; raw-pyserial Modbus RTU master, background poller, write queue, and register cache
 - [test_interfaces/pulser_test_gui.py](test_interfaces/pulser_test_gui.py): primary Python GUI test harness
 - [test_interfaces/bcon_simple_gui.py](test_interfaces/bcon_simple_gui.py): simpler bench GUI
 - [test_interfaces/bcon_simple_modbus.py](test_interfaces/bcon_simple_modbus.py): lower-level host-side Modbus helper
@@ -128,6 +129,33 @@ For bench/debug over USB serial, set `BCON_USE_USB_SERIAL` to `1`, rebuild, and 
 
 Channel runtime status blocks must be read separately as `110-118`, `120-128`, and `130-138`. The channel stride is 10, but offset `+9` is not implemented, so contiguous reads across `119` or `129` are rejected.
 
+## Dashboard Driver Integration
+
+The EBEAM dashboard backend uses `BCONDriver` in `instrumentctl/BCON/bcon_driver.py` as the normal host-side integration point. It talks directly over raw pyserial Modbus RTU instead of `pymodbus`, keeps a thread-safe register cache, and runs a background loop that processes queued writes before polling status.
+
+The driver and firmware are expected to work together this way:
+
+- Connect at slave ID `1`, `115200 8N1`.
+- After opening the serial port, wait for the Mega boot/reset window before sending frames. The dashboard driver currently waits `4.5 s`, flushes serial buffers, writes `WATCHDOG_MS`, then validates communication with a read of registers `0-2`.
+- Send UI actions through the driver's write queue when possible. The poll thread serializes Modbus traffic, runs queued writes first, then refreshes the register cache.
+- Use staged channel control. High-level driver calls write pulse parameters, write `CHx_MODE`, then send `COMMAND=4`.
+- Use `sync_start()` when multiple channels must begin together. It stages all requested channel modes first, then sends a single `COMMAND=4`.
+- Use `COMMAND=1` for all-off. The driver also sends this during disconnect before closing the port.
+- Use `CHx_ENABLE_STATE` as an explicit latched state, not as a blind toggle. The firmware emits the 100 ms enable pulse only when the latched state changes.
+- Confirm nonzero commands from `LAST_CMD_CODE`, `LAST_CMD_RESULT`, `LAST_REJECT_REASON`, and `LAST_CMD_SEQ`, not from the `COMMAND` register echo or queue-depth timing.
+- Treat `FAULT_LATCHED`, `power_status`, `overcurrent`, and `gated` as compatibility placeholders until hardware-backed fault inputs are implemented.
+
+The driver polls only implemented register blocks:
+
+- `0-2`
+- `10-13`, `20-23`, `30-33`
+- `100-109`
+- `110-118`, `120-128`, `130-138`
+- `140-151`
+- `152-153`
+
+It intentionally avoids undefined gaps such as `3-9`, `14-19`, `24-29`, `119`, and `129`.
+
 ## Modes And Pulse Timing
 
 Supported channel modes:
@@ -217,6 +245,8 @@ Runtime status offsets for `110`, `120`, and `130`:
 `COMMAND` writes are normalized into a single-entry supervisor mailbox. The mailbox is drained immediately during the Modbus write callback so legacy hosts keep apply-now behavior, and `loop()` drains it again as a backstop.
 
 After an accepted or rejected nonzero command is processed, the firmware clears `COMMAND` back to `0`. `COMMAND=2`, `COMMAND=3`, and any other unsupported nonzero command are rejected as invalid.
+
+The dashboard driver keeps the software watchdog fresh with regular host activity. It currently writes `WATCHDOG_MS` as a heartbeat when no other writes are pending, and it also polls `SYS_STATE`, which the firmware treats as a watchdog feed.
 
 The optional LCD update is deferred briefly after serial traffic to reduce I2C/RS-485 interference.
 
