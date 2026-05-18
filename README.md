@@ -1,347 +1,276 @@
-# BCON Mega Modbus Pulser Firmware
+# BCON Mega Modbus Firmware
 
-Target hardware: Arduino Mega 2560 (ATmega2560)
+Firmware for running a 3-channel BCON beam-gate pulser from an Arduino Mega 2560. The sketch exposes a Modbus RTU instrument interface, drives gate and enable outputs, supervises interlock/watchdog safety, and is designed around a staged workflow: write channel settings, apply them together, then poll status while keeping the host heartbeat fresh.
 
-Primary firmware: [BCON_mega_modbus/BCON_mega_modbus.ino](BCON_mega_modbus/BCON_mega_modbus.ino)
+## What The Firmware Does
 
-Shared types: [BCON_mega_modbus/bcon_types.h](BCON_mega_modbus/bcon_types.h)
+- Runs as a Modbus RTU slave on an Arduino Mega 2560
+- Uses RS-485 on `Serial1` by default, with optional USB serial bench mode
+- Controls three gate outputs and three enable-toggle outputs
+- Supports `Off`, `DC`, single-pulse, and pulse-train channel modes
+- Stages channel modes before applying them, so multiple pulse channels can start together
+- Generates pulse timing with hardware timers and compare ISRs
+- Forces outputs low when the active-high interlock is not asserted
+- Uses a software watchdog fed by host Modbus activity
+- Enables the AVR hardware watchdog for local lockup recovery
+- Publishes GUI-compatible status plus additive supervisor command/status telemetry
+- Optionally displays watchdog, interlock, and channel state on a 20x4 I2C LCD
 
-Related behavior notes:
-- [BCON_mega_modbus/firmware_architecture_flow.md](BCON_mega_modbus/firmware_architecture_flow.md)
-- [BCON_mega_modbus/BCON User Story _2026-02-15A-BW.md](<BCON_mega_modbus/BCON User Story _2026-02-15A-BW.md>)
+## Main Files
 
-## Overview
+- [BCON_mega_modbus/BCON_mega_modbus.ino](BCON_mega_modbus/BCON_mega_modbus.ino): main firmware, Modbus register callbacks, supervisor, timer pulse engine, GPIO, safety loop, and LCD support
+- [BCON_mega_modbus/bcon_types.h](BCON_mega_modbus/bcon_types.h): shared enums and state structs
+- [EBEAM_dashboard/instrumentctl/BCON/bcon_driver.py](../EBEAM_dashboard/instrumentctl/BCON/bcon_driver.py): dashboard backend driver; raw-pyserial Modbus RTU master, background poller, write queue, and register cache
+- [test_interfaces/pulser_test_gui.py](test_interfaces/pulser_test_gui.py): primary Python GUI test harness
+- [test_interfaces/bcon_simple_gui.py](test_interfaces/bcon_simple_gui.py): simpler bench GUI
+- [test_interfaces/bcon_simple_modbus.py](test_interfaces/bcon_simple_modbus.py): lower-level host-side Modbus helper
 
-This firmware turns the Mega 2560 into a 3-channel Modbus RTU pulser instrument for BCON beam-gate control.
+The main firmware paths are organized around:
 
-Its job is deliberately narrow:
-- receive staged channel parameters and system commands over Modbus
-- supervise safety and command execution
-- drive the protected pulse engine
-- report meaningful state back to the dashboard
+- Modbus register setup and callbacks for host reads/writes
+- A single-entry supervisor command mailbox for `COMMAND` writes
+- Per-channel staged settings and runtime state
+- A protected timer/ISR pulse engine for exact gate timing
+- A safety loop that evaluates interlock and watchdog state every pass through `loop()`
 
-It does not implement beam deflection, waveform generation for the BOP Amp, or dashboard UX behavior beyond the Modbus instrument interface.
-
-## Current Behavior
-
-The current branch keeps the existing timer/ISR pulse engine intact and wraps it with a supervisor-oriented control layer.
-
-Working behaviors confirmed in the latest version:
-- Modbus communication remains functional
-- accurately timed pulses remain functional
-- synchronized multi-channel pulse starts remain functional
-- staged `CHx_MODE` writes plus `COMMAND=4` apply remain functional
-- `COMMAND=1` all-off remains functional
-- watchdog/interlock safety still forces outputs low
-- the firmware now stages system commands through a single-entry supervisor mailbox while preserving legacy apply-now behavior on `COMMAND` writes
-- additive supervisor state and command-result registers are exposed without breaking the legacy GUI register workflow
-
-## Scope
-
-Implemented now:
-- per-channel `Off`, `DC`, `Pulse`, and `PulseTrain`
-- per-channel pulse width (`PULSE_MS`) and count (`COUNT`)
-- synchronized pulse starts across channels
-- ordered supervisor command handling
-- top-level safety gating via interlock and watchdog
-- local LCD status display
-- additive supervisor and command-result telemetry over Modbus
-
-Not part of this firmware:
-- beam deflection control
-- BOP Amp waveform generation
-- dashboard-side experiment graphing
-- firmware ownership of dashboard `Arm Beams` UX
-
-## Architecture
-
-The design intent is to keep exact pulse timing in the protected pulse engine and move control ownership into the supervisor.
+## Architecture Flow
 
 ```mermaid
 flowchart LR
-    A[Dashboard / Modbus] --> B[Staged Registers]
-    A --> C[Single-Entry Command Mailbox]
+    subgraph Host["Host / Test GUI"]
+        Stage["Stage channel settings"]
+        Command["Apply or All Off"]
+        Poll["Poll status"]
+    end
 
-    B --> D[Supervisor]
-    C --> D
+    subgraph Firmware["Mega 2560 Firmware"]
+        Registers["Modbus registers"]
+        Supervisor["Supervisor"]
+        PulseEngine["Timer pulse engine"]
+        Status["Status model"]
+    end
 
-    E[Interlock Input] --> D
-    F[Watchdog Freshness] --> D
+    subgraph Safety["Safety Inputs"]
+        Interlock["Interlock"]
+        Watchdog["Host watchdog"]
+    end
 
-    D --> H[Per-Channel Semantic State]
-    D --> I[Pulse Engine Control]
+    subgraph Hardware["Pulser Hardware"]
+        Gates["Gate outputs"]
+        EnablePins["Enable toggles"]
+        LCD["Optional LCD"]
+    end
 
-    I --> J[Protected Timer HW + ISR]
-    J --> K[Gate Outputs]
-
-    J --> L[Pulse Completion]
-    D --> M[Status Registers]
-    H --> M
-    L --> H
+    Stage --> Registers
+    Command --> Registers
+    Registers --> Supervisor
+    Interlock --> Supervisor
+    Watchdog --> Supervisor
+    Supervisor --> PulseEngine
+    Supervisor --> Status
+    Supervisor --> EnablePins
+    PulseEngine --> Gates
+    Status --> Registers
+    Registers --> Poll
+    Status --> LCD
 ```
 
-## Behavioral Flow
+The supervisor owns command acceptance, safety decisions, and semantic status. The pulse engine owns exact gate-edge timing.
 
-### 1. Command Flow
-
-The dashboard still writes staged parameters exactly as before. `COMMAND` writes are normalized into a single-entry mailbox and then drained immediately so legacy hosts keep their existing `write COMMAND=4` -> apply-now behavior. `loop()` also drains the mailbox as a backstop.
+## Command Flow
 
 ```mermaid
 flowchart TD
-    A[Modbus write arrives] --> B{Register type}
-    B -->|CHx_MODE / CHx_PULSE_MS / CHx_COUNT| C[Stage requested values]
-    B -->|COMMAND| D[Normalize command]
-    D --> E{Valid command and mailbox space available?}
-    E -->|Yes| F[Push command into mailbox]
-    E -->|No| G[Record rejected command result]
-    F --> H[Drain mailbox immediately]
-    H --> I{Command type}
-    I -->|Apply| J[Apply staged modes if safe]
-    I -->|All Off| K[Stop all channels]
-    J --> M[Update status / command result]
-    K --> M
+    Start["Host writes registers"] --> Stage["Stage channel parameters"]
+    Stage --> Apply["COMMAND = 4"]
+    Apply --> Queue["Supervisor mailbox"]
+    Queue --> Safe{System ready?}
+
+    Safe -->|Yes| Run["Apply staged modes together"]
+    Run --> Timing["Start DC holds or synchronized timers"]
+    Timing --> Status["Update runtime and status"]
+
+    Safe -->|No| Reject["Reject apply"]
+    Reject --> Status
+
+    Start --> AllOff["COMMAND = 1"]
+    AllOff --> Stop["Stop all channels"]
+    Stop --> Status
+
+    Start --> Bad["Unsupported command"]
+    Bad --> Reject
+
+    Status --> Clear["Clear COMMAND to 0"]
 ```
 
-After each accepted or rejected command, the firmware clears `COMMAND` back to `0`. `COMMAND=2`, `COMMAND=3`, and any other unsupported nonzero value are rejected as invalid commands.
+`COMMAND=4` preserves the existing apply-now host workflow because the mailbox is drained inside the write callback. `loop()` also drains the mailbox as a backstop.
 
-### 2. Safety Flow
+## Getting Started
 
-Outputs are only allowed while the top-level state is `Ready`.
+Production defaults in [BCON_mega_modbus.ino](BCON_mega_modbus/BCON_mega_modbus.ino):
 
-```mermaid
-flowchart TD
-    A[Main loop] --> B[Evaluate top-level state]
-    B --> C{Interlock OK?}
-    C -->|No| D[SafeInterlock]
-    C -->|Yes| E{Watchdog OK?}
-    E -->|No| F[SafeWatchdog]
-    E -->|Yes| I[Ready]
+- `BCON_USE_USB_SERIAL = 0`
+- `BCON_ENABLE_LCD = 1`
+- Modbus RTU slave ID `1`
+- `115200 8N1`
+- RS-485 transport on `Serial1`
+- RS-485 DE/RE control on `D17`
 
-    D --> J[Force outputs low]
-    F --> J
-    I --> K[Allow DC hold and pulse engine activity]
-```
+For bench/debug over USB serial, set `BCON_USE_USB_SERIAL` to `1`, rebuild, and upload to the Mega 2560.
 
-### 3. Pulse Execution Boundary
+## Typical Host Workflow
 
-The pulse engine remains the timing authority. The supervisor decides when to start or stop it, but does not move pulse timing into `loop()`.
+1. Write `CHx_PULSE_MS` and `CHx_COUNT` for each channel that will change.
+2. Write staged `CHx_MODE` values.
+3. Write `COMMAND=4` to apply staged modes together.
+4. Poll system status and each channel status block.
+5. Keep the software watchdog fresh by polling `SYS_STATE` or writing `COMMAND=0`.
+6. Write `COMMAND=1` to stop all channels and clear staged modes when needed.
 
-```mermaid
-flowchart LR
-    A[Supervisor Apply] --> B[Initialize channel runtime]
-    B --> C[Set first gate state]
-    C --> D[startTimersTogetherUnsafe]
-    D --> E[Timer compare ISR]
-    E --> F[handleTimerCompareBatch]
-    F --> G[Toggle edge / decrement remaining pulses]
-    G --> H{Pulse train complete?}
-    H -->|No| E
-    H -->|Yes| I[Stop timer and latch completion]
-```
+Channel runtime status blocks must be read separately as `110-118`, `120-128`, and `130-138`. The channel stride is 10, but offset `+9` is not implemented, so contiguous reads across `119` or `129` are rejected.
 
-## Safety Model
+## Dashboard Driver Integration
 
-Top-level safety states from [bcon_types.h](BCON_mega_modbus/bcon_types.h):
+The EBEAM dashboard backend uses `BCONDriver` in `instrumentctl/BCON/bcon_driver.py` as the normal host-side integration point. It talks directly over raw pyserial Modbus RTU instead of `pymodbus`, keeps a thread-safe register cache, and runs a background loop that processes queued writes before polling status.
 
-| State | Code | Meaning |
-|---|---:|---|
-| `Ready` | 0 | Outputs may operate |
-| `SafeInterlock` | 1 | Interlock not satisfied; outputs forced low |
-| `SafeWatchdog` | 2 | Heartbeat stale; outputs forced low |
+The driver and firmware are expected to work together this way:
 
-Notes:
-- the software watchdog timeout is configurable through register `0` (`WATCHDOG_MS`)
-- the software watchdog is treated as healthy during the first `8000 ms` after boot (`WD_BOOT_GRACE_MS`)
-- the firmware also enables the AVR hardware watchdog to recover from local lockups
-- the interlock input is checked every loop and blocks new output activity when not asserted
-- in the current branch, DC channels are also cleared during a safety trip so they do not silently reassert after recovery without a fresh command
+- Connect at slave ID `1`, `115200 8N1`.
+- After opening the serial port, wait for the Mega boot/reset window before sending frames. The dashboard driver currently waits `4.5 s`, flushes serial buffers, writes `WATCHDOG_MS`, then validates communication with a read of registers `0-2`.
+- Send UI actions through the driver's write queue when possible. The poll thread serializes Modbus traffic, runs queued writes first, then refreshes the register cache.
+- Use staged channel control. High-level driver calls write pulse parameters, write `CHx_MODE`, then send `COMMAND=4`.
+- Use `sync_start()` when multiple channels must begin together. It stages all requested channel modes first, then sends a single `COMMAND=4`.
+- Use `COMMAND=1` for all-off. The driver also sends this during disconnect before closing the port.
+- Use `CHx_ENABLE_STATE` as an explicit latched state, not as a blind toggle. The firmware emits the 100 ms enable pulse only when the latched state changes.
+- Confirm nonzero commands from `LAST_CMD_CODE`, `LAST_CMD_RESULT`, `LAST_REJECT_REASON`, and `LAST_CMD_SEQ`, not from the `COMMAND` register echo or queue-depth timing.
+- Treat `FAULT_LATCHED`, `power_status`, `overcurrent`, and `gated` as compatibility placeholders until hardware-backed fault inputs are implemented.
 
-## Pulse Modes
+The driver polls only implemented register blocks:
 
-Per-channel output modes from [bcon_types.h](BCON_mega_modbus/bcon_types.h):
+- `0-2`
+- `10-13`, `20-23`, `30-33`
+- `100-109`
+- `110-118`, `120-128`, `130-138`
+- `140-151`
+- `152-153`
+
+It intentionally avoids undefined gaps such as `3-9`, `14-19`, `24-29`, `119`, and `129`.
+
+## Modes And Pulse Timing
+
+Supported channel modes:
 
 | Mode | Code | Behavior |
 |---|---:|---|
-| `Off` | 0 | Gate output low |
-| `DC` | 1 | Gate output held high while allowed |
-| `Pulse` | 2 | Single pulse if `COUNT = 1` |
-| `PulseTrain` | 3 | Repeating pulse train |
+| `Off` | `0` | Gate output low |
+| `DC` | `1` | Gate output held high while the system is safe |
+| `Pulse` | `2` | Single pulse when `COUNT=1` |
+| `PulseTrain` | `3` | Repeating pulse train |
 
-Additional mode detail:
-- `Pulse` with `COUNT > 1` is elevated to `PulseTrain`
-- pulse width is `PULSE_MS`
-- pulse train low gap currently equals `PULSE_MS`
-- pulse timing is generated by hardware timers and compare ISRs, not by loop polling
+Pulse behavior:
 
-## Protected Pulse Engine
+- `Pulse` with `COUNT > 1` is promoted to `PulseTrain`.
+- A pulse starts high immediately when applied.
+- Pulse high time is `PULSE_MS`.
+- Pulse-train low gap is also `PULSE_MS`.
+- Timed pulses are driven by timers `3`, `4`, and `5`, not by `loop()` polling.
+- `startTimersTogetherUnsafe()` synchronizes multi-channel starts.
+- `handleTimerCompareBatch()` handles timer compare edges and pulse completion.
 
-These parts of the firmware are intentionally treated as the protected timing core:
-- timer setup/start/stop/schedule helpers
-- `startTimersTogetherUnsafe()`
-- `handleTimerCompareBatch()`
-- ISR entry points
-- gate-edge write timing
+Writing `CHx_ENABLE_STATE` changes the latched enable state and emits a 100 ms pulse on that channel's enable-toggle output.
 
-The supervisor refactor should continue to treat this layer as timing infrastructure, not business logic.
+## Limits And Safety
 
-## Modbus Interface
+Implemented limits and defaults:
 
-Production transport:
-- Modbus RTU
-- slave ID `1`
-- `115200 8N1`
-- `Serial1` for RS-485 in production
-- optional USB serial for bench/debug builds
+- `WATCHDOG_MS`: `50-60000 ms`, default `1500 ms`
+- Software watchdog boot grace: `8000 ms`
+- `PULSE_MS`: `1-60000 ms`, default `10 ms`
+- `COUNT`: `1-10000`, default `1`
+- Enable-toggle pulse: `100 ms`
+- AVR hardware watchdog: `8 s`
 
-Current build-time options in [BCON_mega_modbus.ino](BCON_mega_modbus/BCON_mega_modbus.ino):
+Top-level safety states:
 
-| Macro | Meaning |
-|---|---|
-| `BCON_USE_USB_SERIAL` | `1` for USB serial bench mode, `0` for RS-485 production mode |
-| `BCON_ENABLE_LCD` | enable or disable the 20x4 I2C LCD |
+| State | Code | Meaning |
+|---|---:|---|
+| `Ready` | `0` | Interlock and software watchdog are healthy; outputs may run |
+| `SafeInterlock` | `1` | Interlock is not asserted; gate outputs are forced low |
+| `SafeWatchdog` | `2` | Host heartbeat is stale; gate outputs are forced low |
 
-Current checked-in defaults on this branch: `BCON_USE_USB_SERIAL=0` and `BCON_ENABLE_LCD=1`.
+Control-register writes feed the software watchdog. Reading `SYS_STATE` also feeds it, matching the existing GUI polling workflow. On a safety trip, the firmware stops timers, forces gates low, clears active/staged channel modes that could drive outputs, and latches affected channels as aborted.
 
-### Control Registers
+## Key Modbus Registers
 
-| Address | Name | Notes |
-|---|---|---|
-| `0` | `WATCHDOG_MS` | software watchdog timeout |
-| `1` | `TELEMETRY_MS` | informational only |
-| `2` | `COMMAND` | single-entry supervisor mailbox; auto-clears to `0` after processing |
-| `10/20/30 +0` | `CHx_MODE` | staged requested mode |
-| `10/20/30 +1` | `CHx_PULSE_MS` | pulse duration |
-| `10/20/30 +2` | `CHx_COUNT` | pulse count |
-| `10/20/30 +3` | `CHx_ENABLE_STATE` | explicit latched enable state (`0` disabled, `1` enabled); changing the state triggers a 100 ms enable output pulse |
+All registers are Modbus holding registers.
 
-### COMMAND Values
+| Address | Name | Purpose |
+|---:|---|---|
+| `0` | `WATCHDOG_MS` | Software watchdog timeout |
+| `1` | `TELEMETRY_MS` | Stored host poll interval hint; not enforced |
+| `2` | `COMMAND` | `0=NOP`, `1=AllOff`, `4=Apply`; other nonzero values are rejected |
+| `10/20/30 +0` | `CHx_MODE` | Staged requested mode |
+| `10/20/30 +1` | `CHx_PULSE_MS` | Pulse duration |
+| `10/20/30 +2` | `CHx_COUNT` | Pulse count |
+| `10/20/30 +3` | `CHx_ENABLE_STATE` | Latched enable state, `0` or `1` |
+| `100` | `SYS_STATE` | Top-level safety state; reading feeds watchdog |
+| `101` | `SYS_REASON` | Mirrors `SYS_STATE` |
+| `102` | `FAULT_LATCHED` | Compatibility placeholder; always `0` |
+| `103` | `INTERLOCK_OK` | `1` when interlock input is high |
+| `104` | `WATCHDOG_OK` | `1` when software watchdog is fresh |
+| `105` | `LAST_ERROR` | Last error code; clears on read |
+| `106` | `SUP_STATE` | Supervisor summary state |
+| `107` | `CMD_QUEUE_DEPTH` | Pending supervisor command count, currently `0` or `1` |
+| `108` | `LAST_CMD_CODE` | Most recent supervisor command |
+| `109` | `LAST_CMD_RESULT` | `0=None`, `1=Queued`, `2=Executed`, `3=Rejected` |
+| `110-118` | CH1 runtime status | Mode, timing, count, remaining pulses, enable state, gate level |
+| `120-128` | CH2 runtime status | Same layout as CH1 |
+| `130-138` | CH3 runtime status | Same layout as CH1 |
+| `140-151` | Channel supervisor status | Semantic state, stop reason, complete latch, abort latch |
+| `152` | `LAST_REJECT_REASON` | `0=None`, `1=InvalidCommand`, `2=QueueFull`, `3=UnsafeInterlock`, `4=UnsafeWatchdog` |
+| `153` | `LAST_CMD_SEQ` | Most recent accepted command sequence ID |
 
-| Value | Meaning |
-|---|---|
-| `0` | NOP / heartbeat write |
-| `1` | all off |
-| `4` | apply staged modes |
-| other nonzero values, including `2` and `3` | rejected as invalid commands |
+Runtime status offsets for `110`, `120`, and `130`:
 
-### Legacy System Status Registers
+- `+0`: active mode
+- `+1`: pulse duration
+- `+2`: pulse count
+- `+3`: pulses remaining
+- `+4`: latched enable state
+- `+5` through `+7`: placeholders, always `0`
+- `+8`: current gate pin level
 
-These remain in place for GUI compatibility.
+## Communication Notes
 
-| Address | Name | Meaning |
-|---|---|---|
-| `100` | `SYS_STATE` | top-level state |
-| `101` | `SYS_REASON` | mirrors `SYS_STATE` |
-| `102` | `FAULT_LATCHED` | reserved compatibility placeholder; current firmware returns `0` unconditionally |
-| `103` | `INTERLOCK_OK` | interlock state |
-| `104` | `WATCHDOG_OK` | watchdog freshness |
-| `105` | `LAST_ERROR` | last error code |
+`COMMAND` writes are normalized into a single-entry supervisor mailbox. The mailbox is drained immediately during the Modbus write callback so legacy hosts keep apply-now behavior, and `loop()` drains it again as a backstop.
 
-### New Supervisor Status Registers
+After an accepted or rejected nonzero command is processed, the firmware clears `COMMAND` back to `0`. `COMMAND=2`, `COMMAND=3`, and any other unsupported nonzero command are rejected as invalid.
 
-These are additive and do not replace the legacy GUI-facing registers.
+The dashboard driver keeps the software watchdog fresh with regular host activity. It currently writes `WATCHDOG_MS` as a heartbeat when no other writes are pending, and it also polls `SYS_STATE`, which the firmware treats as a watchdog feed.
 
-| Address | Name | Meaning |
-|---|---|---|
-| `106` | `SUP_STATE` | overall supervisor summary state |
-| `107` | `CMD_QUEUE_DEPTH` | queued supervisor commands (`0` or `1` in the current build) |
-| `108` | `LAST_CMD_CODE` | most recent command code |
-| `109` | `LAST_CMD_RESULT` | `0=None 1=Queued 2=Executed 3=Rejected` |
-| `152` | `LAST_REJECT_REASON` | most recent reject reason |
-| `153` | `LAST_CMD_SEQ` | most recent accepted command sequence id |
+The optional LCD update is deferred briefly after serial traffic to reduce I2C/RS-485 interference.
 
-### Legacy Per-Channel Runtime Status
+## Maintenance Notes
 
-| Base | Range | Meaning |
-|---|---|---|
-| `110` | `110-118` | CH1 pulse-engine/runtime status |
-| `120` | `120-128` | CH2 pulse-engine/runtime status |
-| `130` | `130-138` | CH3 pulse-engine/runtime status |
+- Keep exact pulse timing in the timer/ISR pulse engine.
+- Keep host policy, command acceptance, and safety decisions in the supervisor layer.
+- Keep Modbus callbacks short; route command execution through the supervisor mailbox.
+- Preserve existing GUI-compatible registers when adding new telemetry.
+- Treat `startTimersTogetherUnsafe()`, `handleTimerCompareBatch()`, timer register helpers, ISR entry points, and gate-edge writes as timing-critical code.
+- Do not make DC outputs silently reassert after a safety trip without a fresh apply command.
 
-Fields:
+## Troubleshooting
 
-| Offset | Name | Meaning |
-|---|---|---|
-| `+0` | `mode` | active runtime mode |
-| `+1` | `pulse_ms` | configured pulse duration |
-| `+2` | `count` | configured pulse count |
-| `+3` | `remaining` | pulses left in active train |
-| `+4` | `enable_status` | latched channel enable state (`0` disabled, `1` enabled) |
-| `+5` | `power_status` | currently not wired, returns `0` |
-| `+6` | `overcurrent` | currently not wired, returns `0` |
-| `+7` | `gated` | currently not wired, returns `0` |
-| `+8` | `output_level` | current gate pin level |
+- If Modbus does not respond, confirm slave ID `1`, `115200 8N1`, transport mode, wiring, and RS-485 direction control on `D17`.
+- If outputs stay low, check `INTERLOCK_OK`, `WATCHDOG_OK`, and `SYS_STATE`.
+- If an apply command is rejected, check `LAST_CMD_RESULT`, `LAST_REJECT_REASON`, and `LAST_ERROR`.
+- If pulse mode unexpectedly reads back as `PulseTrain`, check whether `COUNT > 1`.
+- If status reads fail, read each channel runtime block separately instead of reading `110-138` as one block.
+- If the Arduino build warns about `LiquidCrystal_I2C` architecture compatibility, treat it as a library metadata warning unless the LCD actually fails.
 
-### Per-Channel Supervisor Status
+## Known Limitations
 
-| Base | Range | Meaning |
-|---|---|---|
-| `140` | `140-143` | CH1 semantic supervisor status |
-| `144` | `144-147` | CH2 semantic supervisor status |
-| `148` | `148-151` | CH3 semantic supervisor status |
-
-Fields:
-
-| Offset | Name | Meaning |
-|---|---|---|
-| `+0` | `CH_SUP_STATE` | `Off`, `Staged`, `RunningDC`, `RunningPulse`, `RunningTrain`, `Complete`, `Aborted` |
-| `+1` | `CH_STOP_REASON` | most recent stop/abort reason |
-| `+2` | `CH_COMPLETE` | completion latched flag |
-| `+3` | `CH_ABORTED` | abort latched flag |
-
-## Host Workflow
-
-The existing Python GUI workflow is intentionally preserved:
-
-1. write `PULSE_MS` / `COUNT`
-2. write staged `CHx_MODE`
-3. write `COMMAND=4`
-4. poll `100-105` plus each channel status block separately: `110-118`, `120-128`, and `130-138`
-5. optionally read `106-109`, `140-151`, and `152-153` for richer supervisor and command telemetry
-
-Do not read `110-138` as one contiguous block. The channel status stride has unimplemented gap addresses such as `119` and `129`, and the firmware rejects reads that cross those gaps.
-
-Recommended heartbeat behavior:
-- continue polling `SYS_STATE`; in the current firmware that read also feeds the software watchdog
-- `pulser_test_gui.py` currently also emits periodic `COMMAND=0` writes as defense in depth
-- do not rely on a long silent interval while expecting outputs to remain enabled
-
-## Test Interfaces
-
-The existing host tools remain relevant:
-
-| File | Purpose |
-|---|---|
-| [test_interfaces/pulser_test_gui.py](test_interfaces/pulser_test_gui.py) | primary GUI test harness |
-| [test_interfaces/bcon_simple_gui.py](test_interfaces/bcon_simple_gui.py) | simpler bench GUI |
-| [test_interfaces/bcon_simple_modbus.py](test_interfaces/bcon_simple_modbus.py) | lower-level host-side Modbus helper |
-
-The current firmware branch is intended to remain usable with `pulser_test_gui.py` throughout the supervisor refactor.
-
-## Current Limitations
-
-A few things are intentionally still in transition:
-- the pulse engine is authoritative for exact timing, while the supervisor owns command ordering and semantic reporting
-- live overcurrent inputs and fault-latch behavior are not currently implemented; overcurrent status returns `0` and `FAULT_LATCHED` is a compatibility placeholder
-- channel status fields `+5` through `+7` are placeholders and currently return `0`
-- heartbeat semantics are still backward-compatible with existing GUI polling and periodic NOP writes rather than fully migrated to a dedicated supervisor heartbeat command model
-
-## Development Guidance
-
-If you are extending the firmware, prefer this rule:
-
-Preserve the timer/ISR pulse engine exactly. Improve control ownership around it.
-
-That means:
-- keep exact pulse timing in the pulse engine
-- keep policy and command execution in the supervisor
-- keep Modbus callbacks lightweight
-- expose richer state through additive registers instead of breaking existing GUI workflows
-
-## Note on the LCD Library Warning
-
-The Arduino build may emit a warning like:
-
-`LiquidCrystal_I2C claims to run on all architectures and may be incompatible with avr`
-
-That warning is from library metadata and does not, by itself, indicate a firmware problem. The current firmware targets AVR and uses the LCD only as an optional local status display.
-
+- `FAULT_LATCHED` is reserved for compatibility and always returns `0`.
+- Runtime status fields `power_status`, `overcurrent`, and `gated` are placeholders and always return `0`.
+- `TELEMETRY_MS` is stored but not enforced by the firmware.
+- The firmware does not currently own dashboard-side arm/disarm UX semantics beyond Modbus command/status reporting.
